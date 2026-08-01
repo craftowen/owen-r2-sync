@@ -9,7 +9,7 @@ same note changed on two devices, most sync tools give you a conflicted copy
 or silently pick a winner. This one merges the two versions word by word, and
 only where both sides changed the same words does it keep yours and say so.
 
-<p align="center">If this plugin adds value for you and you would like to help support
+<p>If this plugin adds value for you and you would like to help support
 continued development, please use the buttons below:</p>
 
 <p align="center">
