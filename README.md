@@ -48,7 +48,7 @@ continued development, please use the buttons below:</p>
   connected device, paste it on the new one (that's how mobile connects,
   since the sign-in flow needs a desktop).
 
-## Setup, once, about five minutes
+## Setup, once, in about five minutes
 
 Click the cloud button in any note's header (or "Open setup wizard" in the
 plugin settings). The wizard walks you through it: four links into the Google
