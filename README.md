@@ -45,6 +45,8 @@ Do not place real client secrets, refresh/access tokens, connection codes, Drive
 
 ## Google OAuth setup
 
+한국어 실사용 절차는 [`SETUP_KO.md`](SETUP_KO.md)를 따른다.
+
 The desktop setup wizard links to Google Cloud Console. Create a Desktop OAuth client, enable Drive API, add the account as a test user when applicable, then connect. The authorization request uses `state` and PKCE (`S256`); tokens are exchanged locally. Mobile never starts the desktop loopback server.
 
 The `drive.file` scope lets the app work with files it created or the user explicitly opened with it; this plugin targets one dedicated folder. A real-account smoke test must use an explicit user-owned test folder and is not part of automated tests.
