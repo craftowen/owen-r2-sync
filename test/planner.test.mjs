@@ -163,4 +163,49 @@ t("ambiguous rename falls back to delete plus create", () => {
   assert.deepEqual(kindsOnly, ["deleteRemote", "deleteRemote", "uploadNew", "uploadNew"]);
 });
 
+t("content hash catches equal-mtime edits and ignores mtime-only touches", () => {
+  const base = {
+    "a.md": { fileId: "x", localMtime: 10, localSize: 3, localHash: "old", remoteRev: "r1" },
+  };
+  const remote = { "a.md": { fileId: "x", rev: "r1", size: 3 } };
+  assert.deepEqual(
+    kinds(planSync(base, { "a.md": { mtime: 10, size: 3, hash: "new" } }, remote)),
+    ["uploadUpdate:a.md"]
+  );
+  assert.deepEqual(
+    planSync(base, { "a.md": { mtime: 99, size: 3, hash: "old" } }, remote),
+    []
+  );
+});
+
+t("remote rename requires the same stable Drive file ID", () => {
+  const base = {
+    "old.md": { fileId: "original", localMtime: 10, localSize: 7, remoteRev: "same" },
+  };
+  const local = { "old.md": { mtime: 10, size: 7 } };
+  const remote = { "new.md": { fileId: "different", rev: "same", size: 7 } };
+  assert.deepEqual(
+    planSync(base, local, remote).map((action) => action.kind).sort(),
+    ["deleteLocal", "downloadNew"]
+  );
+});
+
+t("same-ID remote rename plus edit preserves rename and requests content refresh", () => {
+  const base = {
+    "old.md": { fileId: "same-id", localMtime: 10, localSize: 7, remoteRev: "old-rev" },
+  };
+  const local = { "old.md": { mtime: 10, size: 7 } };
+  const remote = { "new.md": { fileId: "same-id", rev: "new-rev", size: 11 } };
+  assert.deepEqual(planSync(base, local, remote), [
+    {
+      kind: "renameLocal",
+      from: "old.md",
+      to: "new.md",
+      fileId: "same-id",
+      remoteChanged: true,
+      remoteSize: 11,
+    },
+  ]);
+});
+
 console.log(`planner extended: ${count} total`);

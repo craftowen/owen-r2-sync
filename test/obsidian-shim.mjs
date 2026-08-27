@@ -25,6 +25,8 @@ export async function requestUrl(opts) {
   return { status: res.status, arrayBuffer, text, json };
 }
 
+export const Platform = { isDesktopApp: false };
+
 // drive.ts uses window.setTimeout for popout-window compatibility inside
 // Obsidian; under node the test provides window as an alias of globalThis.
 if (typeof globalThis.window === "undefined") globalThis.window = globalThis;

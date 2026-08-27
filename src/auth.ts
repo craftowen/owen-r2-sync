@@ -43,6 +43,27 @@ function loadHttp(): HttpModule {
 export interface AuthResult {
   code: string;
   redirectUri: string;
+  codeVerifier: string;
+}
+
+function base64Url(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+export async function createPkce(): Promise<{
+  state: string;
+  codeVerifier: string;
+  codeChallenge: string;
+}> {
+  const state = base64Url(crypto.getRandomValues(new Uint8Array(32)));
+  const codeVerifier = base64Url(crypto.getRandomValues(new Uint8Array(64)));
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(codeVerifier)
+  );
+  return { state, codeVerifier, codeChallenge: base64Url(new Uint8Array(digest)) };
 }
 
 // Google's raw error codes read as gibberish at the worst moment; translate
@@ -70,8 +91,10 @@ export async function startLoopbackAuth(
     );
   }
   const { createServer } = loadHttp();
+  const pkce = await createPkce();
   return new Promise((resolve, reject) => {
     let server: LoopbackServer | null = null;
+    let settled = false;
     const timeout = window.setTimeout(() => {
       server?.close();
       reject(new Error("Sign-in timed out after five minutes."));
@@ -84,26 +107,45 @@ export async function startLoopbackAuth(
 
     server = createServer((req, res) => {
       const url = new URL(req.url ?? "/", "http://127.0.0.1");
+      if (url.pathname !== "/callback") {
+        res.writeHead(204, {});
+        res.end("");
+        return;
+      }
+      if (settled) {
+        res.writeHead(409, { "Content-Type": "text/plain" });
+        res.end("This sign-in request is already complete.");
+        return;
+      }
       const code = url.searchParams.get("code");
       const err = url.searchParams.get("error");
-      res.writeHead(200, { "Content-Type": "text/html" });
+      const returnedState = url.searchParams.get("state");
+      const stateMatches = returnedState === pkce.state;
+      res.writeHead(stateMatches ? 200 : 400, { "Content-Type": "text/html" });
       res.end(
-        code
+        code && stateMatches
           ? "<h2>Connected. You can close this tab and return to Obsidian.</h2>"
           : `<h2>Sign-in failed${err ? `: ${err}` : ""}. Return to Obsidian and try again.</h2>`
       );
+      settled = true;
       window.clearTimeout(timeout);
       const port = portOf(server);
       server?.close();
-      if (code) {
-        resolve({ code, redirectUri: `http://127.0.0.1:${port}` });
+      if (!stateMatches) {
+        reject(new Error("Google sign-in state did not match. No authorization code was accepted."));
+      } else if (code) {
+        resolve({
+          code,
+          redirectUri: `http://127.0.0.1:${port}/callback`,
+          codeVerifier: pkce.codeVerifier,
+        });
       } else {
         reject(new Error(explainAuthError(err)));
       }
     });
 
     server.listen(0, "127.0.0.1", () => {
-      const redirectUri = `http://127.0.0.1:${portOf(server)}`;
+      const redirectUri = `http://127.0.0.1:${portOf(server)}/callback`;
       const params = new URLSearchParams({
         client_id: clientId,
         redirect_uri: redirectUri,
@@ -111,6 +153,9 @@ export async function startLoopbackAuth(
         scope: SCOPE,
         access_type: "offline",
         prompt: "consent",
+        state: pkce.state,
+        code_challenge: pkce.codeChallenge,
+        code_challenge_method: "S256",
       });
       onUrl(`${AUTH_URL}?${params.toString()}`);
     });

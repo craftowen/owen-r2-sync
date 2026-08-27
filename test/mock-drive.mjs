@@ -9,7 +9,15 @@ import { createHash } from "node:crypto";
 export function startMockDrive(port = 0) {
   let nextId = 1;
   const files = new Map(); // id -> {id,name,mimeType,parents,content,trashed,modifiedTime}
-  const state = { failNext: 0, requests: 0 };
+  const state = {
+    failNext: 0,
+    failStatus: 500,
+    failReason: "backendError",
+    requests: 0,
+    commitThenFailFolder: false,
+    commitThenFailUpload: false,
+    revoked: false,
+  };
 
   const md5 = (buf) => createHash("md5").update(buf).digest("hex");
   const meta = (f) => ({
@@ -19,6 +27,8 @@ export function startMockDrive(port = 0) {
     md5Checksum: f.content ? md5(f.content) : undefined,
     size: f.content ? String(f.content.length) : undefined,
     modifiedTime: f.modifiedTime,
+    parents: f.parents,
+    trashed: f.trashed,
   });
 
   const server = createServer((req, res) => {
@@ -36,7 +46,9 @@ export function startMockDrive(port = 0) {
       // Deliberate failures, for the retry test.
       if (state.failNext > 0 && !url.pathname.startsWith("/token")) {
         state.failNext--;
-        return send(500, { error: "injected failure" });
+        return send(state.failStatus, {
+          error: { errors: [{ reason: state.failReason }], message: "injected failure" },
+        });
       }
 
       if (url.pathname === "/token") {
@@ -47,16 +59,25 @@ export function startMockDrive(port = 0) {
         });
       }
 
+      if (url.pathname === "/revoke" && req.method === "POST") {
+        state.revoked = true;
+        res.writeHead(200);
+        return res.end();
+      }
+
       if (url.pathname === "/drive/files" && req.method === "GET") {
         const q = url.searchParams.get("q") ?? "";
         const nameM = q.match(/name = '((?:[^'\\]|\\')*)'/);
         const parentM = q.match(/'([^']+)' in parents/);
-        const wantFolder = q.includes("vnd.google-apps.folder");
+        const wantFolder = q.includes("mimeType = 'application/vnd.google-apps.folder'");
+        const wantNonFolder = q.includes("mimeType != 'application/vnd.google-apps.folder'");
         let list = [...files.values()].filter((f) => !f.trashed);
         if (parentM) list = list.filter((f) => f.parents.includes(parentM[1]));
         if (nameM) list = list.filter((f) => f.name === nameM[1].replace(/\\'/g, "'"));
         if (wantFolder && nameM)
           list = list.filter((f) => f.mimeType === "application/vnd.google-apps.folder");
+        if (wantNonFolder && nameM)
+          list = list.filter((f) => f.mimeType !== "application/vnd.google-apps.folder");
         return send(200, { files: list.map(meta) });
       }
 
@@ -72,6 +93,10 @@ export function startMockDrive(port = 0) {
           modifiedTime: new Date().toISOString(),
         };
         files.set(f.id, f);
+        if (state.commitThenFailFolder) {
+          state.commitThenFailFolder = false;
+          return send(500, { error: "committed folder, lost response" });
+        }
         return send(200, { id: f.id });
       }
 
@@ -82,9 +107,6 @@ export function startMockDrive(port = 0) {
         if (url.searchParams.get("alt") === "media") {
           res.writeHead(200, { "Content-Type": "application/octet-stream" });
           return res.end(f.content ?? Buffer.alloc(0));
-        }
-        if ((url.searchParams.get("fields") ?? "").includes("parents")) {
-          return send(200, { parents: f.parents });
         }
         return send(200, meta(f));
       }
@@ -125,6 +147,10 @@ export function startMockDrive(port = 0) {
         if (j.name) f.name = j.name;
         f.content = content;
         f.modifiedTime = new Date().toISOString();
+        if (!upM[1] && state.commitThenFailUpload) {
+          state.commitThenFailUpload = false;
+          return send(500, { error: "committed upload, lost response" });
+        }
         return send(200, { id: f.id, md5Checksum: md5(content) });
       }
 
@@ -143,6 +169,7 @@ export function startMockDrive(port = 0) {
           api: `http://127.0.0.1:${p}/drive`,
           upload: `http://127.0.0.1:${p}/upload`,
           token: `http://127.0.0.1:${p}/token`,
+          revoke: `http://127.0.0.1:${p}/revoke`,
         },
         close: () => server.close(),
       });

@@ -27,3 +27,19 @@
 .dms-wizard-status.dms-ok {
   color: var(--color-green);
 }
+
+.ogds-preview-warning {
+  color: var(--text-warning);
+  font-weight: var(--font-semibold);
+}
+
+.ogds-preview-list {
+  max-height: min(55vh, 520px);
+  overflow: auto;
+  padding: 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  white-space: pre-wrap;
+}

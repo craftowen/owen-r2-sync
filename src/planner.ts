@@ -11,12 +11,14 @@ export interface BaseEntry {
   fileId: string;
   localMtime: number;
   localSize?: number;
+  localHash?: string;
   remoteRev: string; // md5 checksum or version marker from Drive
 }
 
 export interface LocalEntry {
   mtime: number;
   size: number;
+  hash?: string;
 }
 
 export interface RemoteEntry {
@@ -28,7 +30,14 @@ export interface RemoteEntry {
 
 export type SyncAction =
   | { kind: "renameRemote"; from: string; to: string; fileId: string }
-  | { kind: "renameLocal"; from: string; to: string; fileId: string }
+  | {
+      kind: "renameLocal";
+      from: string;
+      to: string;
+      fileId: string;
+      remoteChanged?: boolean;
+      remoteSize?: number;
+    }
   | { kind: "uploadNew"; path: string }
   | { kind: "uploadUpdate"; path: string; fileId: string }
   | { kind: "downloadNew"; path: string; fileId: string }
@@ -54,7 +63,14 @@ export function planSync(
     const l = local[path];
     const r = remote[path];
 
-    const localChanged = !!(l && (!b || l.mtime > b.localMtime));
+    const localChanged = !!(
+      l &&
+      (!b ||
+        (b.localHash && l.hash
+          ? b.localHash !== l.hash
+          : l.mtime !== b.localMtime ||
+            (b.localSize !== undefined && l.size !== b.localSize)))
+    );
     const remoteChanged = !!(r && (!b || r.rev !== b.remoteRev));
 
     if (l && r) {
@@ -130,8 +146,8 @@ function detectRenames(
       a.kind === "downloadNew" && !base[a.path]
   );
 
-  // Local rename: old path vanished locally, new local path carries the same
-  // size and mtime (renames preserve both).
+  // Local rename: prefer the persisted content hash. The size/mtime fallback
+  // only migrates legacy baselines that predate hashes.
   for (const del of deleteRemotes) {
     const b = base[del.path];
     if (!b || b.localSize === undefined) continue;
@@ -139,8 +155,10 @@ function detectRenames(
       (u) =>
         !consumed.has(u) &&
         local[u.path] &&
-        local[u.path].size === b.localSize &&
-        local[u.path].mtime === b.localMtime
+        (b.localHash && local[u.path].hash
+          ? local[u.path].hash === b.localHash
+          : local[u.path].size === b.localSize &&
+            local[u.path].mtime === b.localMtime)
     );
     if (matches.length === 1) {
       consumed.add(del);
@@ -149,18 +167,30 @@ function detectRenames(
     }
   }
 
-  // Remote rename: old path vanished remotely, a new remote path carries the
-  // same content checksum.
+  // Remote rename: Drive file IDs are stable across rename and move. Matching
+  // on checksum can misidentify a different same-content file.
   for (const del of deleteLocals) {
     const b = base[del.path];
-    if (!b || !b.remoteRev) continue;
+    if (!b?.fileId) continue;
     const matches = downloadNews.filter(
-      (d) => !consumed.has(d) && remote[d.path] && remote[d.path].rev === b.remoteRev
+      (d) =>
+        !consumed.has(d) &&
+        remote[d.path] &&
+        remote[d.path].fileId === b.fileId
     );
     if (matches.length === 1) {
+      const remoteEntry = remote[matches[0].path];
       consumed.add(del);
       consumed.add(matches[0]);
-      out.push({ kind: "renameLocal", from: del.path, to: matches[0].path, fileId: matches[0].fileId });
+      out.push({
+        kind: "renameLocal",
+        from: del.path,
+        to: matches[0].path,
+        fileId: matches[0].fileId,
+        ...(remoteEntry.rev !== b.remoteRev
+          ? { remoteChanged: true, remoteSize: remoteEntry.size }
+          : {}),
+      });
     }
   }
 

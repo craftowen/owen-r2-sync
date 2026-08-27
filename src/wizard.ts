@@ -2,7 +2,7 @@
 // client, so the one-time cost of creating one cannot be removed — but it can
 // be reduced to four links and one paste. The paste box accepts the raw
 // client_secret JSON Google offers for download, or both values in any shape.
-import { Modal, Notice, Setting } from "obsidian";
+import { Modal, Setting } from "obsidian";
 import type DriveMergeSyncPlugin from "./main";
 
 interface ParsedCredentials {
@@ -110,18 +110,9 @@ export class ConnectWizard extends Modal {
 
     new Setting(contentEl)
       .setName("Already connected on another device?")
-      .setDesc("Skip everything above: copy the connection code from that device's settings and paste it here.")
-      .addText((t) => {
-        t.setPlaceholder("Connection code");
-        t.inputEl.addEventListener("keydown", (e) => {
-          if (e.key !== "Enter") return;
-          e.preventDefault();
-          void this.plugin.importConnectionCode(t.getValue()).then((ok) => {
-            new Notice(ok ? "Connected from code." : "That code did not work.");
-            if (ok) this.close();
-          });
-        });
-      });
+      .setDesc(
+        "On iPhone or iPad, close this wizard and use Encrypted device transfer in the plugin settings. Mobile never runs the desktop loopback sign-in server."
+      );
   }
 
   private async onPaste(text: string) {

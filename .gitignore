@@ -3,4 +3,9 @@ main.js
 *.js.map
 test/merge.build.mjs
 test/planner.build.mjs
-test/merge.build.mjs
+test/drive.build.mjs
+test/safety.build.mjs
+test/connection.build.mjs
+test/auth.build.mjs
+test/conflict.build.mjs
+dist/

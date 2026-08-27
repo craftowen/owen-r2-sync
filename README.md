@@ -1,109 +1,65 @@
-# Google Drive Merge Sync
+# Owen Google Drive Sync
 
-[![Downloads](https://img.shields.io/github/downloads/kebl3541/Obsidian-Google-Drive-Merge-Sync/total?style=flat&logo=github&label=Downloads&color=success&cacheSeconds=3600)](https://github.com/kebl3541/Obsidian-Google-Drive-Merge-Sync/releases)
-[![GitHub stars](https://img.shields.io/github/stars/kebl3541/Obsidian-Google-Drive-Merge-Sync?style=flat&logo=github&label=Stars&cacheSeconds=300)](https://github.com/kebl3541/Obsidian-Google-Drive-Merge-Sync/stargazers)
-[![Latest release](https://img.shields.io/github/v/release/kebl3541/Obsidian-Google-Drive-Merge-Sync?style=flat&label=Release&cacheSeconds=3600)](https://github.com/kebl3541/Obsidian-Google-Drive-Merge-Sync/releases/latest)
+Private Obsidian plugin for the `owen-mobile` vault stored under **On My iPhone**. It mirrors selected vault files through one Google Drive folder using the user's own OAuth client and the narrow `drive.file` scope.
 
-Sync your vault with Google Drive, using your own Google credentials. When the
-same note changed on two devices, most sync tools give you a conflicted copy
-or silently pick a winner. This one merges the two versions word by word, and
-only where both sides changed the same words does it keep yours and say so.
+The plugin refuses to sync when the active vault name is not exactly `owen-mobile`.
 
-<p>If this plugin adds value for you and you would like to help support
-continued development, please use the buttons below:</p>
+`owen-brain` remains the source of truth. Google Drive is a transport broker for the mobile mirror, not a backup or an independent knowledge source.
 
-<p align="center">
-<a href="https://www.paypal.com/donate/?business=berlin.philosophy%40gmail.com&no_recurring=0&currency_code=EUR"><img src="https://www.paypalobjects.com/webstatic/mktg/Logo/pp-logo-200px.png" alt="PayPal" height="42"></a>
-&nbsp;&nbsp;
-<a href="https://buymeacoffee.com/philosophizer"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy me a coffee" height="52"></a>
-</p>
+## Runtime contract
 
-<p align="center"><strong><a href="https://buymeacoffee.com/philosophizer">☕ Buy me a coffee</a></strong>&nbsp;&nbsp;·&nbsp;&nbsp;<strong><a href="https://www.paypal.com/donate/?business=berlin.philosophy%40gmail.com&no_recurring=0&currency_code=EUR">💙 Donate via PayPal</a></strong></p>
+- Sync runs only while Obsidian is open and visible: manually, shortly after startup/resume, or after a 30-second edit debounce.
+- iOS background execution is not available or promised.
+- The first sync is always a read-only preview. The plugin does not create a Drive folder or change either side until **Approve and sync** is pressed.
+- Later syncs use a persisted three-way baseline and stable Drive file IDs.
+- Remote deletes use Drive Trash. Local deletes use Obsidian's configured trash.
+- Large delete plans require another preview. An unexpectedly empty remote folder with an existing baseline fails closed.
+- When both sides changed, text keeps both versions with conflict markers and a Drive conflict copy; binary content keeps the local version as a conflict copy while Drive remains canonical.
 
-<p>And if you like this plugin or find it useful, please give it a <a href="https://github.com/kebl3541/Obsidian-Google-Drive-Merge-Sync">star</a> <a href="https://github.com/kebl3541/Obsidian-Google-Drive-Merge-Sync"><img src="https://img.shields.io/github/stars/kebl3541/Obsidian-Google-Drive-Merge-Sync?style=social&cacheSeconds=300" alt="GitHub Repo stars"></a> on GitHub!</p>
+## Mandatory exclusions
 
+The following never enter a preview, upload, download, baseline, rename, or delete payload:
 
-## How it works
+- `.obsidian`, including plugin `data.json`, OAuth state, workspaces, and baseline copies
+- `.trash`, `.git`, `node_modules`
+- `raw`, `owen-raw`, archive folders and archive files
+- build/output/coverage folders
+- `.env*`, credential/client-secret files, private keys, certificates, and connection-code files
 
-- **Every sync starts with a plan.** The plugin compares three states of each
-  file: your local copy, the Drive copy, and the last version both sides
-  agreed on. From those it decides, per file, whether to upload, download,
-  merge, rename, or do nothing. On the very first sync there is no shared
-  history yet, so the whole vault uploads; every sync after that transfers
-  only what changed. You can see the plan without running it: the
-  dry run command lists exactly what a sync would do before it does anything.
-- **Conflicts are merged, not duplicated.** When the same note changed on two
-  devices, the two versions are combined by a word level three way merge
-  against the last synced version. Only where both sides changed the very
-  same words does it keep your side and tell you. The merge engine is shared
-  with the AI Co-Editor plugin and covered by its test suite.
-- **Deletes go to the trash, on both sides.** A file removed on one device is
-  moved to Obsidian's trash locally (following your deletion preference) and
-  to the Drive trash remotely. Both are reversible.
-- **It talks to Drive with your own credentials.** You create a free Google
-  OAuth client once; tokens stay on your machine and are never sent to any
-  third party. The `drive.file` permission means the plugin can only see the
-  one folder it creates in your Drive, nothing else.
-- **Other devices join with a connection code.** Generate the code on the
-  connected device, paste it on the new one (that's how mobile connects,
-  since the sign-in flow needs a desktop).
+Additional folders can be excluded in the plugin settings. Remote paths containing traversal, separators inside a name, control characters, cycles, or duplicate same-name siblings stop the run.
 
-## Setup, once, in about five minutes
+## Install on iOS
 
-Click the cloud button in any note's header (or "Open setup wizard" in the
-plugin settings). The wizard walks you through it: four links into the Google
-console, one paste, one sign-in. The client_secret JSON file Google offers for
-download can be pasted as is; the wizard picks out the two values itself.
+1. Run `npm ci && npm run package` on a development machine.
+2. Copy the contents of `dist/owen-google-drive-sync/` to `On My iPhone/Obsidian/owen-mobile/.obsidian/plugins/owen-google-drive-sync/`.
+3. Enable **Owen Google Drive Sync** in Obsidian Community plugins.
+4. Connect on desktop with a user-owned Google Cloud OAuth Desktop client, or transfer an existing connection with the encrypted device-transfer dialog.
+5. Use a separate 12+ character transfer passphrase on both devices. The encrypted code expires after 15 minutes, contains no access token, and is never saved by the plugin UI.
+6. Run **Preview what a sync would do**, inspect every action, then approve.
 
-The same steps by hand, if you prefer:
+Do not place real client secrets, refresh/access tokens, connection codes, Drive IDs, or vault content in this repository. OAuth material is stored only in Obsidian's local plugin data and is hard-excluded from sync.
 
-1. Go to console.cloud.google.com and create a project (any name).
-2. APIs and Services, Library: enable the Google Drive API.
-3. APIs and Services, OAuth consent screen: External, fill the two required
-   fields, add yourself as a test user.
-4. APIs and Services, Credentials: Create credentials, OAuth client ID, type
-   Desktop app. Copy the client ID and client secret.
-5. In Obsidian, open the plugin settings, paste both values, press Connect
-   Google Drive, and approve in the browser.
+## Google OAuth setup
 
-## Use
+The desktop setup wizard links to Google Cloud Console. Create a Desktop OAuth client, enable Drive API, add the account as a test user when applicable, then connect. The authorization request uses `state` and PKCE (`S256`); tokens are exchanged locally. Mobile never starts the desktop loopback server.
 
-- Click the cloud button in a note's header, the sync icon in the ribbon, or
-  run the command "Sync now".
-- Optionally set an interval in settings for automatic syncing.
-- "Preview what a sync would do" shows the plan without touching anything.
-- On a second device, install the plugin, connect with the same Google
-  account, set the same folder name, and sync.
+The `drive.file` scope lets the app work with files it created or the user explicitly opened with it; this plugin targets one dedicated folder. A real-account smoke test must use an explicit user-owned test folder and is not part of automated tests.
 
-## Mobile
+## Development and verification
 
-Sign in once on a desktop, then in settings copy the connection code and paste
-it into the same setting on your phone or tablet. The device syncs from then
-on without any browser dance. Treat the code like a password.
+All automated tests are mock/local only and never contact Google:
 
-## Renames
+```bash
+npm ci
+npm run check
+```
 
-Renames sync as renames on both sides: links keep pointing at the note, and
-Drive keeps the file's history. When two renamed files are indistinguishable,
-the plugin falls back to the safe delete plus create rather than guess.
+`check` runs typecheck, ESLint, unit tests, mock Drive integration tests, a production build, and package-content validation. The package contains exactly `main.js`, `manifest.json`, `styles.css`, and `LICENSE`.
 
-## Security and privacy
+## Known boundary
 
-Points Obsidian's automated plugin review flags, and what they mean here:
+This repository does not implement the Mac `owen-brain` bridge yet. Device installation, Obsidian iOS resume behavior, the real trash preference, and real Google OAuth/Drive response compatibility require a separately authorized dedicated-folder smoke test.
 
-- **Vault enumeration**: a sync plugin has one job, comparing every local file with its remote counterpart, so it necessarily lists the vault's files each sync. Folders you exclude in settings are skipped. File contents are read only to upload, download, or merge them.
-- **Clipboard**: written to exactly once, when you click "Copy connection code" to move your connection to another device. The plugin never reads the clipboard.
-- **Where your data goes**: only to Google Drive, over your own OAuth client with the narrow `drive.file` scope, meaning the plugin can only ever see the folder it created and nothing else in your Drive. Tokens stay on your machine; no third-party server is involved, ever.
+## Upstream and license
 
-## Support
-
-If this plugin adds value for you and you would like to help support continued
-development, please use the buttons below:
-
-<a href="https://www.paypal.com/donate/?business=berlin.philosophy%40gmail.com&no_recurring=0&currency_code=EUR"><img src="https://www.paypalobjects.com/webstatic/mktg/Logo/pp-logo-200px.png" alt="PayPal" height="42"></a>
-&nbsp;&nbsp;
-<a href="https://buymeacoffee.com/philosophizer"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy me a coffee" height="52"></a>
-
-## License
-
-MIT
+This private fork is based on **Google Drive Merge Sync** by kebl3541. Upstream attribution and the MIT [`LICENSE`](LICENSE) are preserved. The private plugin identity, packaging, and safety policy are Owen-specific; it is not intended for Obsidian Marketplace publication.
