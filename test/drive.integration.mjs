@@ -61,6 +61,31 @@ const up2 = await client.upload("a.md", rootId, enc("hello again"), up.id);
 assert.equal(up2.id, up.id);
 assert.notEqual(up2.md5Checksum, up.md5Checksum);
 
+// Files larger than 5 MiB use bounded, chunked resumable upload. An ambiguous
+// chunk response is reconciled through the session status without duplicates.
+const large = new Uint8Array(6 * 1024 * 1024 + 17);
+for (let index = 0; index < large.length; index++) large[index] = index % 251;
+mock.state.failResumableChunkAfterCommit = true;
+const largeUpload = await client.upload("large.bin", rootId, large.buffer);
+assert.ok(mock.state.resumableChunks >= 2);
+assert.deepEqual(new Uint8Array(await client.download(largeUpload.id)), large);
+assert.equal(
+  [...mock.files.values()].filter((file) => file.name === "large.bin").length,
+  1
+);
+const changedLarge = large.slice();
+changedLarge[changedLarge.length - 1] = 7;
+const largeUpdate = await client.upload(
+  "large.bin",
+  rootId,
+  changedLarge.buffer,
+  largeUpload.id,
+  largeUpload.md5Checksum
+);
+assert.equal(largeUpdate.id, largeUpload.id);
+assert.deepEqual(new Uint8Array(await client.download(largeUpload.id)), changedLarge);
+await client.trash(largeUpload.id);
+
 // Nested folders and a move (rename into a subfolder).
 const subId = await client.ensurePath(rootId, ["notes", "daily"], new Map());
 await client.move(up.id, "b.md", subId);
@@ -96,8 +121,44 @@ mock.state.failReason = "insufficientFilePermissions";
 await assert.rejects(() => client.download(up3.id), /Drive returned 403/);
 assert.equal(mock.state.requests, requestsBefore403 + 1);
 
+// File IDs are encoded consistently across metadata, content, update, move,
+// and trash URLs instead of being interpolated as path/query syntax.
+mock.files.set("id with space", {
+  id: "id with space",
+  name: "encoded-id.md",
+  mimeType: "application/octet-stream",
+  parents: [rootId],
+  content: Buffer.from("before"),
+  trashed: false,
+  modifiedTime: new Date().toISOString(),
+});
+const encodedMeta = await client.metadata("id with space");
+await client.upload(
+  "encoded-id.md",
+  rootId,
+  enc("after"),
+  "id with space",
+  encodedMeta.md5Checksum
+);
+assert.equal(dec(await client.download("id with space")), "after");
+await client.trash("id with space");
+
+// A Drive item name containing a path separator is rejected before it can be
+// confused with an actual nested vault path.
+mock.files.set("unsafe-name", {
+  id: "unsafe-name",
+  name: "nested/name.md",
+  mimeType: "application/octet-stream",
+  parents: [rootId],
+  content: Buffer.from("unsafe"),
+  trashed: false,
+  modifiedTime: new Date().toISOString(),
+});
+await assert.rejects(() => client.listTree(rootId), /Unsafe Drive item name/);
+mock.files.delete("unsafe-name");
+
 await DriveClient.revokeToken("mock-refresh", mock.endpoints.revoke);
 assert.equal(mock.state.revoked, true);
 
 mock.close();
-console.log("drive integration: idempotency, retry, and file-ID assertions passed");
+console.log("drive integration: multipart/resumable idempotency and file-ID assertions passed");

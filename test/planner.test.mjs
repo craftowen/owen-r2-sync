@@ -126,8 +126,6 @@ t("mixed tree plans deterministically", () => {
   ]);
 });
 
-console.log(`planner: ${count} tests passed`);
-
 t("local rename becomes renameRemote", () => {
   const base = { "old.md": { fileId: "x", localMtime: 10, localSize: 7, remoteRev: "r1" } };
   const local = { "new.md": { mtime: 10, size: 7 } };
@@ -208,4 +206,4 @@ t("same-ID remote rename plus edit preserves rename and requests content refresh
   ]);
 });
 
-console.log(`planner extended: ${count} total`);
+console.log(`planner: ${count} tests passed`);

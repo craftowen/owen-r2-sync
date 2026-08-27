@@ -3,12 +3,15 @@
 // which is exactly the vault mirror and nothing else in anyone's Drive.
 
 import { type RequestUrlResponse, requestUrl } from "obsidian";
-import { assertSafeRemotePath } from "./safety";
+import { assertSafeRemoteName, assertSafeRemotePath } from "./safety";
 
 const API = "https://www.googleapis.com/drive/v3";
 const UPLOAD = "https://www.googleapis.com/upload/drive/v3";
 const TOKEN_URL = "https://oauth2.googleapis.com/token";
 const REVOKE_URL = "https://oauth2.googleapis.com/revoke";
+const MULTIPART_LIMIT = 5 * 1024 * 1024;
+const RESUMABLE_CHUNK_SIZE = 4 * 1024 * 1024;
+const MAX_RESUMABLE_RECOVERIES = 3;
 
 // Swappable for tests: a local mock server can stand in for Google.
 export interface DriveEndpoints {
@@ -48,7 +51,9 @@ interface CallOptions {
   method?: string;
   body?: string | ArrayBuffer;
   contentType?: string;
+  headers?: Record<string, string>;
   retry?: "safe" | "none";
+  acceptedStatuses?: number[];
 }
 
 function escapeQueryValue(value: string): string {
@@ -63,6 +68,25 @@ function sameBytes(a: ArrayBuffer, b: ArrayBuffer): boolean {
     if (left[index] !== right[index]) return false;
   }
   return true;
+}
+
+function responseHeader(headers: Record<string, string>, name: string): string | null {
+  const wanted = name.toLocaleLowerCase();
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLocaleLowerCase() === wanted) return value;
+  }
+  return null;
+}
+
+function resumableOffset(headers: Record<string, string>, total: number): number {
+  const range = responseHeader(headers, "range");
+  if (!range) return 0;
+  const match = /^bytes=0-(\d+)$/i.exec(range.trim());
+  const next = match ? Number(match[1]) + 1 : Number.NaN;
+  if (!Number.isSafeInteger(next) || next < 0 || next > total) {
+    throw new Error("Drive returned an invalid resumable upload range.");
+  }
+  return next;
 }
 
 export class DriveClient {
@@ -177,7 +201,7 @@ export class DriveClient {
         res = await requestUrl({
           url,
           method: init.method ?? "GET",
-          headers: { Authorization: `Bearer ${t}` },
+          headers: { Authorization: `Bearer ${t}`, ...init.headers },
           contentType: init.contentType,
           body: init.body,
           throw: false,
@@ -186,7 +210,7 @@ export class DriveClient {
         lastErr = e;
         continue;
       }
-      if (res.status < 300) return res;
+      if (res.status < 300 || init.acceptedStatuses?.includes(res.status)) return res;
       if (res.status === 401 && !refreshedAfter401) {
         await this.token(true);
         refreshedAfter401 = true;
@@ -302,7 +326,9 @@ export class DriveClient {
       visited.add(folderId);
       let pageToken = "";
       do {
-        const q = encodeURIComponent(`'${folderId}' in parents and trashed = false`);
+        const q = encodeURIComponent(
+          `'${escapeQueryValue(folderId)}' in parents and trashed = false`
+        );
         const fields = encodeURIComponent(
           "nextPageToken, files(id,name,mimeType,md5Checksum,size,modifiedTime)"
         );
@@ -311,6 +337,7 @@ export class DriveClient {
         );
         const j = res.json as { files: DriveFile[]; nextPageToken?: string };
         for (const f of j.files) {
+          assertSafeRemoteName(f.name);
           const path = prefix ? `${prefix}/${f.name}` : f.name;
           assertSafeRemotePath(path);
           if (f.mimeType === "application/vnd.google-apps.folder") {
@@ -337,7 +364,9 @@ export class DriveClient {
     expectedSize?: number
   ): Promise<ArrayBuffer> {
     await this.assertRevision(fileId, expectedRevision);
-    const res = await this.call(`${this.ep.api}/files/${fileId}?alt=media`);
+    const res = await this.call(
+      `${this.ep.api}/files/${encodeURIComponent(fileId)}?alt=media`
+    );
     if (expectedSize !== undefined && res.arrayBuffer.byteLength !== expectedSize) {
       throw new Error("Drive download size did not match the planned metadata.");
     }
@@ -367,6 +396,9 @@ export class DriveClient {
       }
     }
     if (existingId) await this.assertRevision(existingId, expectedRevision);
+    if (content.byteLength > MULTIPART_LIMIT) {
+      return this.uploadResumable(name, parentId, content, existingId);
+    }
     let lastError: unknown;
     const attempts = existingId ? 1 : 3;
     for (let attempt = 0; attempt < attempts; attempt++) {
@@ -386,7 +418,7 @@ export class DriveClient {
       body.set(tailB, headB.length + content.byteLength);
 
       const url = existingId
-        ? `${this.ep.upload}/files/${existingId}?uploadType=multipart&fields=id,md5Checksum`
+        ? `${this.ep.upload}/files/${encodeURIComponent(existingId)}?uploadType=multipart&fields=id,md5Checksum`
         : `${this.ep.upload}/files?uploadType=multipart&fields=id,md5Checksum`;
       try {
         const res = await this.call(url, {
@@ -413,6 +445,76 @@ export class DriveClient {
     throw lastError instanceof Error ? lastError : new Error("Drive file creation failed.");
   }
 
+  private async uploadResumable(
+    name: string,
+    parentId: string,
+    content: ArrayBuffer,
+    existingId?: string
+  ): Promise<{ id: string; md5Checksum?: string }> {
+    const metadata = existingId ? { name } : { name, parents: [parentId] };
+    const initialUrl = existingId
+      ? `${this.ep.upload}/files/${encodeURIComponent(existingId)}?uploadType=resumable&fields=id,md5Checksum`
+      : `${this.ep.upload}/files?uploadType=resumable&fields=id,md5Checksum`;
+    const initial = await this.call(initialUrl, {
+      method: existingId ? "PATCH" : "POST",
+      retry: "safe",
+      contentType: "application/json; charset=UTF-8",
+      headers: {
+        "X-Upload-Content-Type": "application/octet-stream",
+        "X-Upload-Content-Length": String(content.byteLength),
+      },
+      body: JSON.stringify(metadata),
+    });
+    const sessionUrl = responseHeader(initial.headers, "location");
+    if (!sessionUrl) throw new Error("Drive did not return a resumable upload session URL.");
+
+    let offset = 0;
+    let recoveries = 0;
+    while (offset < content.byteLength) {
+      const end = Math.min(offset + RESUMABLE_CHUNK_SIZE, content.byteLength);
+      try {
+        const response = await this.call(sessionUrl, {
+          method: "PUT",
+          retry: "none",
+          contentType: "application/octet-stream",
+          headers: {
+            "Content-Length": String(end - offset),
+            "Content-Range": `bytes ${offset}-${end - 1}/${content.byteLength}`,
+          },
+          body: content.slice(offset, end),
+          acceptedStatuses: [308],
+        });
+        if (response.status !== 308) {
+          return response.json as { id: string; md5Checksum?: string };
+        }
+        const next = resumableOffset(response.headers, content.byteLength);
+        if (next <= offset) {
+          throw new Error("Drive resumable upload made no forward progress.");
+        }
+        offset = next;
+        recoveries = 0;
+      } catch (error) {
+        recoveries++;
+        if (recoveries > MAX_RESUMABLE_RECOVERIES) throw error;
+        const status = await this.call(sessionUrl, {
+          method: "PUT",
+          retry: "safe",
+          headers: {
+            "Content-Length": "0",
+            "Content-Range": `bytes */${content.byteLength}`,
+          },
+          body: new ArrayBuffer(0),
+          acceptedStatuses: [308],
+        });
+        if (status.status !== 308) {
+          return status.json as { id: string; md5Checksum?: string };
+        }
+        offset = resumableOffset(status.headers, content.byteLength);
+      }
+    }
+    throw new Error("Drive resumable upload ended without file metadata.");
+  }
+
   // Rename and, if needed, move a file to a different parent folder.
   async move(
     fileId: string,
@@ -421,12 +523,13 @@ export class DriveClient {
     expectedRevision?: string
   ): Promise<void> {
     await this.assertRevision(fileId, expectedRevision);
-    const cur = await this.call(`${this.ep.api}/files/${fileId}?fields=parents`);
+    const encodedId = encodeURIComponent(fileId);
+    const cur = await this.call(`${this.ep.api}/files/${encodedId}?fields=parents`);
     const parents = ((cur.json as { parents?: string[] }).parents ?? []).join(",");
     const q = parents
-      ? `?addParents=${newParentId}&removeParents=${parents}`
-      : `?addParents=${newParentId}`;
-    await this.call(`${this.ep.api}/files/${fileId}${q}`, {
+      ? `?addParents=${encodeURIComponent(newParentId)}&removeParents=${encodeURIComponent(parents)}`
+      : `?addParents=${encodeURIComponent(newParentId)}`;
+    await this.call(`${this.ep.api}/files/${encodedId}${q}`, {
       method: "PATCH",
       contentType: "application/json",
       body: JSON.stringify({ name: newName }),
@@ -435,7 +538,7 @@ export class DriveClient {
 
   async trash(fileId: string, expectedRevision?: string): Promise<void> {
     await this.assertRevision(fileId, expectedRevision);
-    await this.call(`${this.ep.api}/files/${fileId}`, {
+    await this.call(`${this.ep.api}/files/${encodeURIComponent(fileId)}`, {
       method: "PATCH",
       contentType: "application/json",
       body: JSON.stringify({ trashed: true }),

@@ -28,6 +28,7 @@ import {
   decryptConnectionPayload,
   encryptConnectionPayload,
   importedTokens,
+  presentConnectionCode,
 } from "./connection";
 
 export interface DriveMergeSettings {
@@ -79,7 +80,7 @@ interface PlanSnapshot {
   requiresApproval: boolean;
 }
 
-const TEXT_EXTENSIONS = new Set(["md", "txt", "json", "css", "csv", "canvas"]);
+const TEXT_EXTENSIONS = new Set(["md", "txt"]);
 
 function bytesEqual(a: ArrayBuffer, b: ArrayBuffer): boolean {
   if (a.byteLength !== b.byteLength) return false;
@@ -100,6 +101,7 @@ export default class DriveMergeSyncPlugin extends Plugin {
   private statusEl: HTMLElement | null = null;
   private syncing = false;
   private editDebounceHandle: number | null = null;
+  private approvalNoticeFingerprint: string | null = null;
   private seenViews = new WeakSet<object>();
   private headerButtons = new Set<HTMLElement>();
   // Test hook: point the client at a mock Drive server instead of Google.
@@ -123,6 +125,11 @@ export default class DriveMergeSyncPlugin extends Plugin {
       id: "dry-run",
       name: "Preview what a sync would do (dry run)",
       callback: () => void this.syncNow(true, "manual"),
+    });
+    this.addCommand({
+      id: "reset-sync-baseline",
+      name: "Reset sync baseline for recovery",
+      callback: () => new BaselineResetModal(this.app, () => void this.resetBaseline()).open(),
     });
 
     this.addSettingTab(new DriveMergeSettingTab(this));
@@ -313,6 +320,19 @@ export default class DriveMergeSyncPlugin extends Plugin {
     }
   }
 
+  async resetBaseline() {
+    this.rootFolderId = null;
+    this.base = {};
+    this.baselineIdentity = null;
+    this.firstSyncApproved = false;
+    this.journal = null;
+    this.approvalNoticeFingerprint = null;
+    await this.clearBaselineFiles();
+    await this.persist();
+    this.setStatus(this.tokens ? "preview required" : "not connected");
+    new Notice("Sync baseline reset. The next sync is a read-only first-sync preview.");
+  }
+
   private client(): DriveClient | null {
     if (!this.tokens) return null;
     return new DriveClient(
@@ -365,9 +385,15 @@ export default class DriveMergeSyncPlugin extends Plugin {
         approvedFingerprint !== undefined && approvedFingerprint !== snapshot.fingerprint;
       if (dryRun || approvalChanged || (snapshot.requiresApproval && !approvedFingerprint)) {
         this.setStatus("preview required");
-        if (trigger === "manual") this.showPreview(snapshot);
+        if (trigger === "manual") {
+          this.showPreview(snapshot);
+        } else if (this.approvalNoticeFingerprint !== snapshot.fingerprint) {
+          this.approvalNoticeFingerprint = snapshot.fingerprint;
+          new Notice("Drive sync is paused for review. Run the preview command to approve it.");
+        }
         return;
       }
+      this.approvalNoticeFingerprint = null;
       await this.executeSnapshot(drive, snapshot);
     } catch (e) {
       console.error("Owen Google Drive Sync failed", e);
@@ -393,20 +419,35 @@ export default class DriveMergeSyncPlugin extends Plugin {
       Object.entries(baseSource).filter(([path]) => !this.excluded(path))
     );
 
+    const mandatoryExcludedPaths = new Set<string>();
     const local: Record<string, LocalEntry> = {};
     for (const file of this.app.vault.getFiles()) {
+      if (isMandatoryExcluded(file.path, this.app.vault.configDir)) {
+        mandatoryExcludedPaths.add(file.path);
+        continue;
+      }
       if (this.excluded(file.path)) continue;
-      const bytes = await this.app.vault.readBinary(file);
+      const previous = base[file.path];
+      const reusableHash =
+        previous?.localHash &&
+        previous.localMtime === file.stat.mtime &&
+        previous.localSize === file.stat.size
+          ? previous.localHash
+          : null;
       local[file.path] = {
         mtime: file.stat.mtime,
         size: file.stat.size,
-        hash: await sha256Hex(bytes),
+        hash: reusableHash ?? await sha256Hex(await this.app.vault.readBinary(file)),
       };
     }
 
     const remote: Record<string, RemoteEntry> = {};
     if (rootId) {
       for (const [path, file] of await drive.listTree(rootId)) {
+        if (isMandatoryExcluded(path, this.app.vault.configDir)) {
+          mandatoryExcludedPaths.add(path);
+          continue;
+        }
         if (this.excluded(path)) continue;
         remote[path] = {
           fileId: file.id,
@@ -425,6 +466,12 @@ export default class DriveMergeSyncPlugin extends Plugin {
       firstSync
     );
     const warnings = [...safety.warnings];
+    if (mandatoryExcludedPaths.size > 0) {
+      const count = mandatoryExcludedPaths.size;
+      warnings.push(
+        `${count} ${count === 1 ? "file was" : "files were"} omitted by mandatory exclusion rules.`
+      );
+    }
     if (this.journal) warnings.push("A previous run was interrupted; this plan was rebuilt from current state.");
     const fingerprint = [
       identity ?? `new:${folderName}`,
@@ -456,9 +503,6 @@ export default class DriveMergeSyncPlugin extends Plugin {
     const folderName = this.settings.driveFolderName.trim() || this.app.vault.getName();
     const rootId = snapshot.rootId ?? (await drive.ensureFolder(folderName));
     await drive.verifyFolder(rootId);
-    if (snapshot.rootId && snapshot.rootId !== rootId) {
-      throw new Error("Drive folder changed after preview. Preview again.");
-    }
     this.rootFolderId = rootId;
     const identity = `${this.app.vault.getName()}:${rootId}`;
     this.base = snapshot.base;
@@ -623,7 +667,8 @@ export default class DriveMergeSyncPlugin extends Plugin {
 
   private async assertLocalSnapshot(
     path: string,
-    expected: LocalEntry | undefined
+    expected: LocalEntry | undefined,
+    verifyContent = true
   ): Promise<TFile | null> {
     const current = this.app.vault.getAbstractFileByPath(path);
     if (!expected) {
@@ -633,9 +678,18 @@ export default class DriveMergeSyncPlugin extends Plugin {
     if (!(current instanceof TFile)) {
       throw new Error(`${path}: local file disappeared after planning.`);
     }
-    const hash = await sha256Hex(await this.app.vault.readBinary(current));
-    if (expected.hash && hash !== expected.hash) {
+    const stat = await this.freshStat(current);
+    if (
+      stat.mtime !== expected.mtime ||
+      (expected.size !== undefined && stat.size !== expected.size)
+    ) {
       throw new Error(`${path}: local file changed after planning.`);
+    }
+    if (verifyContent && expected.hash) {
+      const hash = await sha256Hex(await this.app.vault.readBinary(current));
+      if (hash !== expected.hash) {
+        throw new Error(`${path}: local file changed after planning.`);
+      }
     }
     return current;
   }
@@ -727,11 +781,16 @@ export default class DriveMergeSyncPlugin extends Plugin {
 
       case "uploadNew":
       case "uploadUpdate": {
-        const file = await this.assertLocalSnapshot(action.path, local[action.path]);
+        const expected = local[action.path];
+        const file = await this.assertLocalSnapshot(action.path, expected, false);
         if (!(file instanceof TFile)) throw new Error(`${action.path}: upload source is missing.`);
         const content = await this.app.vault.readBinary(file);
+        const localHash = await sha256Hex(content);
+        if (expected?.hash && localHash !== expected.hash) {
+          throw new Error(`${action.path}: local file changed after planning.`);
+        }
         const parentId = await drive.ensurePath(rootId, parts, folderCache);
-        await this.assertLocalSnapshot(action.path, local[action.path]);
+        await this.assertLocalSnapshot(action.path, expected, false);
         const uploaded = await drive.upload(
           name,
           parentId,
@@ -739,12 +798,13 @@ export default class DriveMergeSyncPlugin extends Plugin {
           action.kind === "uploadUpdate" ? action.fileId : undefined,
           action.kind === "uploadUpdate" ? remote[action.path]?.rev : undefined
         );
-        await this.assertLocalSnapshot(action.path, local[action.path]);
+        await this.assertLocalSnapshot(action.path, expected, false);
+        const stableStat = await this.freshStat(file);
         this.base[action.path] = {
           fileId: uploaded.id,
-          localMtime: file.stat.mtime,
-          localSize: file.stat.size,
-          localHash: await sha256Hex(content),
+          localMtime: stableStat.mtime,
+          localSize: stableStat.size,
+          localHash,
           remoteRev: uploaded.md5Checksum ?? "",
         };
         if (this.isTextPath(action.path)) {
@@ -871,8 +931,8 @@ export default class DriveMergeSyncPlugin extends Plugin {
         file,
         remoteEntry?.rev
       );
-      onMerge();
       if (result.conflicts > 0) {
+        onMerge();
         new Notice(
           `${path}: both versions were preserved with conflict markers and a Drive copy.`
         );
@@ -992,6 +1052,33 @@ export default class DriveMergeSyncPlugin extends Plugin {
   }
 }
 
+class BaselineResetModal extends Modal {
+  constructor(app: App, private reset: () => void) {
+    super(app);
+  }
+
+  onOpen() {
+    this.setTitle("Reset sync baseline");
+    this.contentEl.empty();
+    this.contentEl.createEl("p", {
+      text: "This keeps the Google connection but forgets the current folder and last-common baseline. The next sync is a read-only first-sync preview.",
+    });
+    new Setting(this.contentEl)
+      .addButton((button) => button.setButtonText("Cancel").onClick(() => this.close()))
+      .addButton((button) => {
+        button.setButtonText("Reset baseline");
+        button.onClick(() => {
+          this.close();
+          this.reset();
+        });
+      });
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
 class SyncPreviewModal extends Modal {
   constructor(
     app: App,
@@ -1058,7 +1145,11 @@ class ConnectionTransferModal extends Modal {
         this.passphrase = value;
       });
     });
+    let displayCode = (_value: string) => undefined;
     new Setting(contentEl).setName("Connection code").addTextArea((area) => {
+      displayCode = (value) => {
+        area.setValue(value);
+      };
       area.setPlaceholder("Encrypted code").onChange((value) => {
         this.code = value;
       });
@@ -1074,8 +1165,18 @@ class ConnectionTransferModal extends Modal {
               return;
             }
             this.code = code;
-            await navigator.clipboard.writeText(code);
-            new Notice("Encrypted connection code copied. It expires in 15 minutes.");
+            const copied = await presentConnectionCode(
+              code,
+              displayCode,
+              navigator.clipboard?.writeText
+                ? (value) => navigator.clipboard.writeText(value)
+                : undefined
+            );
+            new Notice(
+              copied
+                ? "Encrypted connection code copied. It expires in 15 minutes."
+                : "Encrypted connection code is shown above, but clipboard copy was unavailable."
+            );
           } catch (error) {
             new Notice(error instanceof Error ? error.message : String(error));
           }

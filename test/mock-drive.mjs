@@ -8,7 +8,9 @@ import { createHash } from "node:crypto";
 
 export function startMockDrive(port = 0) {
   let nextId = 1;
+  let nextSessionId = 1;
   const files = new Map(); // id -> {id,name,mimeType,parents,content,trashed,modifiedTime}
+  const sessions = new Map();
   const state = {
     failNext: 0,
     failStatus: 500,
@@ -16,6 +18,9 @@ export function startMockDrive(port = 0) {
     requests: 0,
     commitThenFailFolder: false,
     commitThenFailUpload: false,
+    rejectUploadName: null,
+    failResumableChunkAfterCommit: false,
+    resumableChunks: 0,
     revoked: false,
   };
 
@@ -102,7 +107,7 @@ export function startMockDrive(port = 0) {
 
       const fileM = url.pathname.match(/^\/drive\/files\/([^/]+)$/);
       if (fileM && req.method === "GET") {
-        const f = files.get(fileM[1]);
+        const f = files.get(decodeURIComponent(fileM[1]));
         if (!f) return send(404, { error: "not found" });
         if (url.searchParams.get("alt") === "media") {
           res.writeHead(200, { "Content-Type": "application/octet-stream" });
@@ -112,7 +117,7 @@ export function startMockDrive(port = 0) {
       }
 
       if (fileM && req.method === "PATCH") {
-        const f = files.get(fileM[1]);
+        const f = files.get(decodeURIComponent(fileM[1]));
         if (!f) return send(404, { error: "not found" });
         const j = body.length ? JSON.parse(body.toString()) : {};
         if (j.trashed) f.trashed = true;
@@ -126,14 +131,37 @@ export function startMockDrive(port = 0) {
       }
 
       const upM = url.pathname.match(/^\/upload\/files(?:\/([^/]+))?$/);
+      if (upM && url.searchParams.get("uploadType") === "resumable") {
+        const metadata = JSON.parse(body.toString());
+        if (state.rejectUploadName === metadata.name) {
+          return send(413, { error: "injected upload rejection" });
+        }
+        const sessionId = `s${nextSessionId++}`;
+        sessions.set(sessionId, {
+          existingId: upM[1] ? decodeURIComponent(upM[1]) : null,
+          metadata,
+          total: Number(req.headers["x-upload-content-length"]),
+          content: Buffer.alloc(0),
+          complete: null,
+        });
+        const address = server.address();
+        res.writeHead(200, {
+          Location: `http://127.0.0.1:${address.port}/upload-session/${sessionId}`,
+        });
+        return res.end();
+      }
+
       if (upM && url.searchParams.get("uploadType") === "multipart") {
         const boundary = (req.headers["content-type"] ?? "").match(/boundary=(.+)$/)?.[1];
         const text = body.toString("latin1");
         const parts = text.split(`--${boundary}`).slice(1, -1);
         const cut = (p) => p.slice(p.indexOf("\r\n\r\n") + 4).replace(/\r\n$/, "");
         const j = JSON.parse(cut(parts[0]));
+        if (state.rejectUploadName === j.name) {
+          return send(413, { error: "injected upload rejection" });
+        }
         const content = Buffer.from(cut(parts[1]), "latin1");
-        let f = upM[1] ? files.get(upM[1]) : null;
+        let f = upM[1] ? files.get(decodeURIComponent(upM[1])) : null;
         if (!f) {
           f = {
             id: "f" + nextId++,
@@ -152,6 +180,65 @@ export function startMockDrive(port = 0) {
           return send(500, { error: "committed upload, lost response" });
         }
         return send(200, { id: f.id, md5Checksum: md5(content) });
+      }
+
+      const sessionM = url.pathname.match(/^\/upload-session\/([^/]+)$/);
+      if (sessionM && req.method === "PUT") {
+        const session = sessions.get(sessionM[1]);
+        if (!session) return send(404, { error: "expired upload session" });
+        const contentRange = req.headers["content-range"] ?? "";
+        if (contentRange.startsWith("bytes */")) {
+          if (session.complete) return send(200, meta(session.complete));
+          const headers = session.content.length
+            ? { Range: `bytes=0-${session.content.length - 1}` }
+            : {};
+          res.writeHead(308, headers);
+          return res.end();
+        }
+
+        const match = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(contentRange);
+        if (!match) return send(400, { error: "invalid content range" });
+        const start = Number(match[1]);
+        const end = Number(match[2]);
+        const total = Number(match[3]);
+        if (
+          start !== session.content.length ||
+          end - start + 1 !== body.length ||
+          total !== session.total
+        ) {
+          return send(400, { error: "unexpected resumable offset" });
+        }
+        session.content = Buffer.concat([session.content, body]);
+        state.resumableChunks++;
+        if (session.content.length === total) {
+          let f = session.existingId ? files.get(session.existingId) : null;
+          if (!f) {
+            f = {
+              id: "f" + nextId++,
+              name: session.metadata.name,
+              mimeType: "application/octet-stream",
+              parents: session.metadata.parents ?? ["root"],
+              trashed: false,
+            };
+            files.set(f.id, f);
+          }
+          if (session.metadata.name) f.name = session.metadata.name;
+          f.content = session.content;
+          f.modifiedTime = new Date().toISOString();
+          session.complete = f;
+          if (state.failResumableChunkAfterCommit) {
+            state.failResumableChunkAfterCommit = false;
+            return send(500, { error: "committed resumable chunk, lost response" });
+          }
+          return send(200, meta(f));
+        }
+        const headers = { Range: `bytes=0-${session.content.length - 1}` };
+        if (state.failResumableChunkAfterCommit) {
+          state.failResumableChunkAfterCommit = false;
+          return send(500, { error: "committed resumable chunk, lost response" });
+        }
+        res.writeHead(308, headers);
+        return res.end();
       }
 
       send(404, { error: `no route for ${req.method} ${url.pathname}` });

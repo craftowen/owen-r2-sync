@@ -131,3 +131,18 @@ export function importedTokens(payload: ConnectionPayload): DriveTokens {
     expiresAt: 0,
   };
 }
+
+export async function presentConnectionCode(
+  code: string,
+  display: (value: string) => void,
+  writeClipboard?: (value: string) => Promise<void>
+): Promise<boolean> {
+  display(code);
+  if (!writeClipboard) return false;
+  try {
+    await writeClipboard(code);
+    return true;
+  } catch {
+    return false;
+  }
+}

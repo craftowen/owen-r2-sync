@@ -83,14 +83,15 @@ function explainAuthError(err: string | null): string {
 
 export async function startLoopbackAuth(
   clientId: string,
-  onUrl: (url: string) => void
+  onUrl: (url: string) => void,
+  httpModule?: HttpModule
 ): Promise<AuthResult> {
   if (!Platform.isDesktopApp) {
     throw new Error(
       "Sign in on a desktop first, then move the connection to this device with the connection code in settings."
     );
   }
-  const { createServer } = loadHttp();
+  const { createServer } = httpModule ?? loadHttp();
   const pkce = await createPkce();
   return new Promise((resolve, reject) => {
     let server: LoopbackServer | null = null;

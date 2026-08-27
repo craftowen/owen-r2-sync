@@ -3,6 +3,7 @@ import {
   decryptConnectionPayload,
   encryptConnectionPayload,
   importedTokens,
+  presentConnectionCode,
 } from "./connection.build.mjs";
 
 const now = 1_800_000_000_000;
@@ -33,4 +34,24 @@ await assert.rejects(
   /expired/
 );
 
-console.log("connection: encrypted, expiring, refresh-only device transfer passed");
+let displayed = "";
+assert.equal(
+  await presentConnectionCode("code-that-must-remain-visible", (value) => {
+    displayed = value;
+  }),
+  false
+);
+assert.equal(displayed, "code-that-must-remain-visible");
+let copied = "";
+assert.equal(
+  await presentConnectionCode(
+    "copy-me",
+    (value) => { displayed = value; },
+    async (value) => { copied = value; }
+  ),
+  true
+);
+assert.equal(displayed, "copy-me");
+assert.equal(copied, "copy-me");
+
+console.log("connection: encrypted transfer and clipboard-fallback display passed");

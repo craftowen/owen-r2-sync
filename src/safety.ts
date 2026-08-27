@@ -34,12 +34,26 @@ export function isMandatoryExcluded(path: string, configDir: string): boolean {
   const name = lower[lower.length - 1] ?? "";
   if (!name) return true;
   if (name === "data.json" || name === "credentials.json") return true;
-  if (name === ".env" || name.startsWith(".env.")) return true;
+  if (name === ".env" || name.startsWith(".env.") || name === ".envrc") return true;
   if (name.startsWith("client_secret") || name.includes("connection-code")) return true;
   if (name === "workspace" || name.startsWith("workspace.json")) return true;
   if (ARCHIVE_EXTENSIONS.some((extension) => name.endsWith(extension))) return true;
   if (SECRET_EXTENSIONS.some((extension) => name.endsWith(extension))) return true;
   return false;
+}
+
+/** Validate one Drive item name before joining it into a vault-relative path. */
+export function assertSafeRemoteName(name: string): void {
+  if (
+    !name ||
+    name === "." ||
+    name === ".." ||
+    name.includes("/") ||
+    name.includes("\\") ||
+    /\p{Cc}/u.test(name)
+  ) {
+    throw new Error(`Unsafe Drive item name: ${JSON.stringify(name)}`);
+  }
 }
 
 /** Remote names are untrusted input. Invalid paths stop the run instead of escaping the vault. */
@@ -107,8 +121,8 @@ export function assessPlanSafety(
   const warnings: string[] = [];
   if (firstSync) warnings.push("First sync: review every action before approving.");
   const deleteRatio = deletes / Math.max(1, baseCount);
-  if (deletes >= 20 || deleteRatio > 0.1) {
-    warnings.push(`${deletes} deletes exceed the automatic safety limit.`);
+  if (deletes >= 3 || (deletes >= 2 && deleteRatio > 0.1)) {
+    warnings.push(`${deletes} ${deletes === 1 ? "delete" : "deletes"} exceed the automatic safety limit.`);
   }
   if (actions.some((action) => action.kind === "conflict")) {
     warnings.push("Both-changed files will preserve both versions.");

@@ -1,6 +1,7 @@
 import { strict as assert } from "node:assert";
 import {
   assessPlanSafety,
+  assertSafeRemoteName,
   assertSafeRemotePath,
   assertTargetVault,
   conflictCopyPath,
@@ -17,6 +18,7 @@ for (const path of [
   "archives/vault.zip",
   "dist/main.js",
   ".env.production",
+  ".envrc",
   "keys/private.pem",
   "client_secret_test.json",
 ]) {
@@ -26,6 +28,10 @@ assert.equal(isMandatoryExcluded("notes/daily.md", ".obsidian"), false);
 assert.doesNotThrow(() => assertTargetVault("owen-mobile"));
 assert.throws(() => assertTargetVault("owen-brain"), /only syncs/);
 assert.doesNotThrow(() => assertSafeRemotePath("notes/daily.md"));
+assert.doesNotThrow(() => assertSafeRemoteName("daily.md"));
+for (const name of ["", ".", "..", "nested/name.md", "a\\b.md", "bad\u0000name"] ) {
+  assert.throws(() => assertSafeRemoteName(name), /Unsafe Drive item name/);
+}
 for (const path of ["../escape.md", "/absolute.md", "a\\b.md", "a//b.md"]) {
   assert.throws(() => assertSafeRemotePath(path), /Unsafe Drive path/);
 }
@@ -43,6 +49,24 @@ const mass = assessPlanSafety(
   false
 );
 assert.equal(mass.requiresApproval, true);
+assert.equal(
+  assessPlanSafety([{ kind: "deleteLocal", path: "one.md" }], 5, 4, false)
+    .requiresApproval,
+  false
+);
+assert.equal(
+  assessPlanSafety(
+    [
+      { kind: "deleteLocal", path: "one.md" },
+      { kind: "deleteLocal", path: "two.md" },
+      { kind: "deleteLocal", path: "three.md" },
+    ],
+    1000,
+    997,
+    false
+  ).requiresApproval,
+  true
+);
 
 const partitioned = partitionActions([
   { kind: "deleteRemote", path: "gone.md", fileId: "gone" },
