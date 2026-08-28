@@ -10,7 +10,7 @@ The plugin refuses to sync when the active vault name is not exactly `owen-mobil
 
 - Sync runs only while Obsidian is open and visible: manually, shortly after startup/resume, or after a 30-second edit debounce.
 - iOS background execution is not available or promised.
-- The first sync is always a read-only preview. The plugin does not create a Drive folder or change either side until **Approve and sync** is pressed.
+- A fresh unconfigured install always starts with a read-only preview. Owen's generated iPhone package is an exception only because it embeds a hash-verified baseline that was independently checked against the live Drive folder before packaging.
 - Later syncs use a persisted three-way baseline and stable Drive file IDs. Files whose mtime and size still match the baseline reuse the persisted content hash instead of rereading the whole vault.
 - Files larger than 5 MiB use 4 MiB resumable chunks with bounded status recovery; smaller files use multipart upload.
 - Remote deletes use Drive Trash. Local deletes use Obsidian's configured trash.
@@ -23,6 +23,7 @@ The plugin refuses to sync when the active vault name is not exactly `owen-mobil
 The following never enter a preview, upload, download, baseline, rename, or delete payload:
 
 - `.obsidian`, including plugin `data.json`, OAuth state, workspaces, and baseline copies
+- the Mac bridge access marker `RCLONE_TEST`
 - `.trash`, `.git`, `node_modules`
 - `raw`, `owen-raw`, archive folders and archive files
 - build/output/coverage folders (these reserved folder names are excluded at any depth)
@@ -32,12 +33,12 @@ Additional folders can be excluded in the plugin settings. The preview reports h
 
 ## Install on iOS
 
-1. Run `npm ci && npm run package` on a development machine.
-2. Copy the contents of `dist/owen-google-drive-sync/` to `On My iPhone/Obsidian/owen-mobile/.obsidian/plugins/owen-google-drive-sync/`.
-3. Enable **Owen Google Drive Sync** in Obsidian Community plugins.
-4. Connect on desktop with a user-owned Google Cloud OAuth Desktop client, or transfer an existing connection with the encrypted device-transfer dialog.
-5. Use a separate 12+ character transfer passphrase on both devices. The encrypted code expires after 15 minutes, contains no access token, and is never saved by the plugin UI.
-6. Run **Preview what a sync would do**, inspect every action, then approve.
+1. AirDrop `/Users/owen/Documents/Obsidian-iPhone-Ready/owen-mobile-ios-ready.zip` to the iPhone.
+2. In Files, extract it and move the resulting `owen-mobile` folder to **On My iPhone → Obsidian**.
+3. Open that local `owen-mobile` vault in Obsidian. The plugin, production OAuth connection, folder ID, and verified baseline are already present.
+4. Confirm the status bar says `Drive: ready`; use **Sync with Google Drive** once if the automatic startup sync has not completed yet.
+
+The ready ZIP contains a Google refresh token and must not be shared. Remove it from transfer locations after the iPhone installation is confirmed.
 
 If Drive's folder was intentionally replaced or emptied and the fail-closed guard stops sync, run **Reset sync baseline for recovery**. This keeps the OAuth connection, forgets only the folder/baseline identity, and forces another read-only first-sync preview.
 
@@ -51,6 +52,8 @@ The desktop setup wizard links to Google Cloud Console. Create a Desktop OAuth c
 
 The `drive.file` scope lets the app work with files it created or the user explicitly opened with it; this plugin targets one dedicated folder. A real-account smoke test must use an explicit user-owned test folder and is not part of automated tests.
 
+The OAuth app is in Production with only `drive.file`. Public app information and the privacy policy are hosted at <https://vault-sync.aasoft.link/> and <https://vault-sync.aasoft.link/privacy/>.
+
 ## Development and verification
 
 All automated tests are mock/local only and never contact Google:
@@ -62,20 +65,18 @@ npm run check
 
 `check` runs typecheck, ESLint, planner/conflict/security/executor unit tests, mock Drive integration tests (including resumable upload recovery), a production build, mobile bundle loading, and package-content validation. The package contains exactly `main.js`, `manifest.json`, `styles.css`, and `LICENSE`.
 
-### Authorized real-device smoke checklist
+### Real-account verification completed on Mac
 
-This checklist has not been run by automated tests and must use an explicit user-owned disposable Drive folder:
+The user-owned disposable Drive folders verified:
 
-1. Install the packaged plugin in a disposable local `owen-mobile` vault on the target iOS device.
-2. Import a short-lived encrypted connection code; confirm the first run only previews and creates nothing before approval.
-3. In the dedicated Drive test folder, verify upload/download, rename, Drive Trash, Obsidian trash, a both-changed Markdown note, a both-changed Canvas file, and a file larger than 5 MiB.
-4. Interrupt one large upload, foreground Obsidian again, and confirm the rebuilt preview/retry creates no duplicate sibling.
-5. Replace or empty the dedicated Drive folder, confirm fail-closed behavior, then use baseline reset and inspect the new first-sync preview.
-6. Remove the disposable folder and revoke the test OAuth grant after recording results.
+1. Real OAuth authorization with the production client and exact `drive.file` consent text.
+2. Five-file synthetic upload including a 6 MiB fixture, zero hash differences, stable Drive file ID across rename/update, and Drive Trash behavior.
+3. Mac bridge bidirectional propagation, mobile-delete restoration, and isolated both-changed conflict preservation.
+4. Production `owen-mobile` contains 414 bridge-visible files (413 vault files plus `RCLONE_TEST`) with zero differences; the prepared iPhone baseline produces zero planner actions.
 
 ## Known boundary
 
-This repository does not implement the Mac `owen-brain` bridge yet. Device installation, secure-context Web Crypto, clipboard behavior, Obsidian iOS resume timing, the real trash preference, and real Google OAuth/Drive response compatibility remain unverified until the separately authorized checklist above is completed.
+The Mac `owen-brain ↔ staging ↔ Google Drive` bridge is installed under `/Users/owen/Scripts/owen-brain` and runs every 60 seconds through `com.owen.brain.mobile-sync`. Actual Obsidian iOS loading, foreground/resume timing, iOS local trash behavior, and the final on-device sync remain the only unverified boundary.
 
 ## Upstream and license
 

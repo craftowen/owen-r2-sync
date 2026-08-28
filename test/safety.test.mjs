@@ -21,6 +21,7 @@ for (const path of [
   ".envrc",
   "keys/private.pem",
   "client_secret_test.json",
+  "RCLONE_TEST",
 ]) {
   assert.equal(isMandatoryExcluded(path, ".obsidian"), true, `${path} must be excluded`);
 }
