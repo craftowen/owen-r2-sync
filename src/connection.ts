@@ -1,20 +1,16 @@
-import type { DriveTokens } from "./drive";
-
-const PREFIX = "OWEN-GDRIVE-1";
+const PREFIX = "OWEN-R2-1";
 const ITERATIONS = 210_000;
 const MAX_AGE_MS = 15 * 60 * 1000;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
 export interface ConnectionPayload {
-  version: 1;
+  version: 2;
   issuedAt: number;
   expiresAt: number;
-  clientId: string;
-  clientSecret: string;
-  refreshToken: string;
-  rootFolderId: string | null;
-  driveFolderName: string;
+  workerUrl: string;
+  apiToken: string;
+  vaultId: string;
 }
 
 function toBase64Url(bytes: Uint8Array): string {
@@ -64,7 +60,7 @@ export async function encryptConnectionPayload(
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const key = await deriveKey(passphrase, salt);
   const payload: ConnectionPayload = {
-    version: 1,
+    version: 2,
     issuedAt: now,
     expiresAt: now + MAX_AGE_MS,
     ...input,
@@ -96,13 +92,12 @@ export async function decryptConnectionPayload(
   );
   const payload = JSON.parse(decoder.decode(plain)) as Partial<ConnectionPayload>;
   if (
-    payload.version !== 1 ||
-    typeof payload.clientId !== "string" ||
-    typeof payload.clientSecret !== "string" ||
-    typeof payload.refreshToken !== "string" ||
-    !payload.clientId ||
-    !payload.clientSecret ||
-    !payload.refreshToken ||
+    payload.version !== 2 ||
+    typeof payload.workerUrl !== "string" ||
+    typeof payload.apiToken !== "string" ||
+    typeof payload.vaultId !== "string" ||
+    payload.apiToken.length < 24 ||
+    !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(payload.vaultId) ||
     typeof payload.issuedAt !== "number" ||
     typeof payload.expiresAt !== "number" ||
     payload.issuedAt > now + 5 * 60 * 1000 ||
@@ -112,24 +107,9 @@ export async function decryptConnectionPayload(
   ) {
     throw new Error("Connection code is expired or incomplete.");
   }
-  if (
-    payload.rootFolderId !== null &&
-    (typeof payload.rootFolderId !== "string" || !payload.rootFolderId)
-  ) {
-    throw new Error("Connection code Drive folder is invalid.");
-  }
-  if (typeof payload.driveFolderName !== "string") {
-    throw new Error("Connection code folder name is invalid.");
-  }
+  const worker = new URL(payload.workerUrl);
+  if (worker.protocol !== "https:") throw new Error("Connection code Worker URL must use HTTPS.");
   return payload as ConnectionPayload;
-}
-
-export function importedTokens(payload: ConnectionPayload): DriveTokens {
-  return {
-    accessToken: "",
-    refreshToken: payload.refreshToken,
-    expiresAt: 0,
-  };
 }
 
 export async function presentConnectionCode(

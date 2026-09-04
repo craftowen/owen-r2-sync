@@ -13,6 +13,7 @@ const obsidian = {
   Platform: { isDesktopApp: false },
   Plugin: Empty,
   PluginSettingTab: Empty,
+  SecretComponent: Empty,
   Setting: Empty,
   TFile: Empty,
   normalizePath: (path) => path,

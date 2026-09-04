@@ -9,4 +9,11 @@ test/connection.build.mjs
 test/auth.build.mjs
 test/conflict.build.mjs
 test/main.build.mjs
+test/r2.build.mjs
 dist/
+.dev.vars
+worker/.dev.vars
+worker/coverage/
+worker/.wrangler/
+worker/worker-startup.cpuprofile
+worker/wrangler.production.jsonc

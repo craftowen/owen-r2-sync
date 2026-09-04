@@ -1,0 +1,25 @@
+{
+  "name": "owen-r2-sync-worker",
+  "version": "1.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit",
+    "check": "npm run types:check && npm run build && npm run test",
+    "check:release": "npm run check && npm run deploy:dry && npm run startup",
+    "deploy:dry": "wrangler deploy --dry-run",
+    "dev": "wrangler dev --local",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "startup": "wrangler check startup",
+    "types": "wrangler types worker-configuration.d.ts",
+    "types:check": "wrangler types worker-configuration.d.ts --check"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "latest",
+    "@vitest/coverage-istanbul": "latest",
+    "typescript": "latest",
+    "vitest": "latest",
+    "wrangler": "latest"
+  }
+}

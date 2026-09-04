@@ -105,6 +105,17 @@ t("same path born on both sides is a conflict", () => {
   );
 });
 
+t("same path and hash on first R2 sync adopts without a download", () => {
+  assert.deepEqual(
+    kinds(planSync(
+      {},
+      { "a.md": { mtime: 5, size: 1, hash: "same" } },
+      { "a.md": { fileId: "x", rev: "r1", size: 1, hash: "same" } }
+    )),
+    ["adopt:a.md"]
+  );
+});
+
 t("mixed tree plans deterministically", () => {
   const base = {
     "keep.md": { fileId: "k", localMtime: 1, remoteRev: "r" },
@@ -176,7 +187,7 @@ t("content hash catches equal-mtime edits and ignores mtime-only touches", () =>
   );
 });
 
-t("remote rename requires the same stable Drive file ID", () => {
+t("remote rename requires the same stable R2 file ID", () => {
   const base = {
     "old.md": { fileId: "original", localMtime: 10, localSize: 7, remoteRev: "same" },
   };

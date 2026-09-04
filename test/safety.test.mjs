@@ -13,10 +13,16 @@ for (const path of [
   ".obsidian/plugins/owen-google-drive-sync/data.json",
   ".obsidian/workspace.json",
   ".trash/deleted.md",
+  ".mobile-sync-trash/deleted.md",
   ".git/config",
   "owen-raw/export.json",
   "archives/vault.zip",
   "dist/main.js",
+  "output/report.json",
+  "60-studio/20-draft/private.md",
+  ".DS_Store",
+  "AGENTS.md",
+  "CLAUDE.md",
   ".env.production",
   ".envrc",
   "keys/private.pem",
@@ -27,14 +33,15 @@ for (const path of [
 }
 assert.equal(isMandatoryExcluded("notes/daily.md", ".obsidian"), false);
 assert.doesNotThrow(() => assertTargetVault("owen-mobile"));
-assert.throws(() => assertTargetVault("owen-brain"), /only syncs/);
+assert.doesNotThrow(() => assertTargetVault("owen-brain"));
+assert.throws(() => assertTargetVault("other-vault"), /only syncs/);
 assert.doesNotThrow(() => assertSafeRemotePath("notes/daily.md"));
 assert.doesNotThrow(() => assertSafeRemoteName("daily.md"));
 for (const name of ["", ".", "..", "nested/name.md", "a\\b.md", "bad\u0000name"] ) {
-  assert.throws(() => assertSafeRemoteName(name), /Unsafe Drive item name/);
+  assert.throws(() => assertSafeRemoteName(name), /Unsafe R2 item name/);
 }
 for (const path of ["../escape.md", "/absolute.md", "a\\b.md", "a//b.md"]) {
-  assert.throws(() => assertSafeRemotePath(path), /Unsafe Drive path/);
+  assert.throws(() => assertSafeRemotePath(path), /Unsafe R2 path/);
 }
 
 const first = assessPlanSafety([{ kind: "uploadNew", path: "a.md" }], 0, 0, true);
@@ -49,7 +56,8 @@ const mass = assessPlanSafety(
   80,
   false
 );
-assert.equal(mass.requiresApproval, true);
+assert.equal(mass.requiresApproval, false);
+assert.match(mass.warnings.join(" "), /applied automatically/);
 assert.equal(
   assessPlanSafety([{ kind: "deleteLocal", path: "one.md" }], 5, 4, false)
     .requiresApproval,
@@ -66,7 +74,7 @@ assert.equal(
     997,
     false
   ).requiresApproval,
-  true
+  false
 );
 
 const partitioned = partitionActions([
@@ -77,6 +85,6 @@ const partitioned = partitionActions([
 assert.deepEqual(partitioned.transfers.map((action) => action.kind), ["uploadNew"]);
 assert.deepEqual(partitioned.serial.map((action) => action.kind), ["conflict"]);
 assert.deepEqual(partitioned.deletes.map((action) => action.kind), ["deleteRemote"]);
-assert.equal(conflictCopyPath("notes/a.md", "Drive", 123), "notes/a (Drive conflict 123).md");
+assert.equal(conflictCopyPath("notes/a.md", "R2", 123), "notes/a (R2 conflict 123).md");
 
 console.log("safety: exclusions, approval gates, and destructive ordering passed");

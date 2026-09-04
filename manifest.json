@@ -1,9 +1,9 @@
 {
   "id": "owen-google-drive-sync",
-  "name": "Owen Google Drive Sync",
-  "version": "1.0.0",
-  "minAppVersion": "1.7.2",
-  "description": "Private foreground-only Google Drive mirror for Owen's mobile Obsidian vault, with previewed first sync and conflict preservation.",
+  "name": "Owen R2 Sync",
+  "version": "2.2.0",
+  "minAppVersion": "1.11.4",
+  "description": "Private foreground-only Cloudflare R2 sync with one-request indexing, conflict preservation, and immutable version history.",
   "author": "Owen",
   "isDesktopOnly": false
 }

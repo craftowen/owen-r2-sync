@@ -32,7 +32,23 @@ export async function requestUrl(opts) {
 
 export const Platform = { isDesktopApp: true };
 
-export class App {}
+export class App {
+  constructor() {
+    const secrets = new Map();
+    this.secretStorage = {
+      getSecret: (id) => secrets.get(id) ?? null,
+      setSecret: (id, value) => { secrets.set(id, value); },
+      listSecrets: () => [...secrets.keys()],
+    };
+    this.workspace = {
+      activeFile: null,
+      getActiveFile: () => this.workspace.activeFile,
+      getLeavesOfType: () => [],
+      on: () => ({}),
+      onLayoutReady: (callback) => callback(),
+    };
+  }
+}
 
 const SharedTFile = globalThis.__obsidianTestTFile ?? class TFile {
   constructor(path, bytes = new ArrayBuffer(0), mtime = Date.now()) {
@@ -44,11 +60,20 @@ globalThis.__obsidianTestTFile = SharedTFile;
 export { SharedTFile as TFile };
 
 class MockElement {
-  empty() {}
-  createEl() { return new MockElement(); }
-  createDiv() { return new MockElement(); }
-  setText() {}
-  addClass() {}
+  constructor(options = {}) {
+    this.children = [];
+    this.text = options.text ?? "";
+    this.cls = options.cls ?? "";
+  }
+  empty() { this.children = []; }
+  createEl(_tag, options = {}) {
+    const child = new MockElement(options);
+    this.children.push(child);
+    return child;
+  }
+  createDiv(options = {}) { return this.createEl("div", options); }
+  setText(text) { this.text = String(text); }
+  addClass(cls) { this.cls = `${this.cls} ${cls}`.trim(); }
   detach() {}
   querySelectorAll() { return []; }
 }
@@ -68,12 +93,13 @@ export class Plugin {
     this.app = app;
     this.manifest = { id: "owen-google-drive-sync" };
     this.__data = null;
+    this.__commands = [];
   }
   async loadData() { return this.__data; }
   async saveData(data) { this.__data = structuredClone(data); }
   addStatusBarItem() { return new MockElement(); }
   addRibbonIcon() { return new MockElement(); }
-  addCommand() {}
+  addCommand(command) { this.__commands.push(command); return command; }
   addSettingTab() {}
   registerEvent() {}
   registerDomEvent() {}
@@ -110,6 +136,11 @@ export class Setting {
   addText(callback) { callback(new Component()); return this; }
   addTextArea(callback) { callback(new Component()); return this; }
   addToggle(callback) { callback(new Component()); return this; }
+  addComponent(callback) { callback(new Component()); return this; }
+}
+
+export class SecretComponent extends Component {
+  constructor() { super(); }
 }
 
 export class PluginSettingTab {

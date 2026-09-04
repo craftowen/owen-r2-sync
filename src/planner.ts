@@ -1,5 +1,5 @@
 // The sync brain: a pure three-way diff between the last agreed state (base),
-// the local vault, and the remote Drive folder. No I/O, fully testable.
+// the local vault, and the remote R2 namespace. No I/O, fully testable.
 //
 // The rules protect data the way a careful human would:
 // - changed on one side only: carry the change to the other side
@@ -12,7 +12,7 @@ export interface BaseEntry {
   localMtime: number;
   localSize?: number;
   localHash?: string;
-  remoteRev: string; // md5 checksum or version marker from Drive
+  remoteRev: string; // R2 ETag revision token
 }
 
 export interface LocalEntry {
@@ -25,10 +25,12 @@ export interface RemoteEntry {
   fileId: string;
   rev: string;
   size: number;
-  mtime?: number; // epoch ms, when Drive reported modifiedTime
+  mtime?: number;
+  hash?: string; // SHA-256 from R2 custom metadata
 }
 
 export type SyncAction =
+  | { kind: "adopt"; path: string; fileId: string }
   | { kind: "renameRemote"; from: string; to: string; fileId: string }
   | {
       kind: "renameLocal";
@@ -75,9 +77,13 @@ export function planSync(
 
     if (l && r) {
       if (!b) {
-        // Same path appeared independently on both sides: treat as conflict
-        // unless we can prove equality later at execution time.
-        actions.push({ kind: "conflict", path, fileId: r.fileId });
+        // R2's one-request index includes the content hash. Matching files can
+        // establish a baseline without downloading hundreds of unchanged notes.
+        actions.push(
+          l.hash && r.hash && l.hash === r.hash
+            ? { kind: "adopt", path, fileId: r.fileId }
+            : { kind: "conflict", path, fileId: r.fileId }
+        );
       } else if (localChanged && remoteChanged) {
         actions.push({ kind: "conflict", path, fileId: r.fileId });
       } else if (localChanged) {
@@ -167,8 +173,8 @@ function detectRenames(
     }
   }
 
-  // Remote rename: Drive file IDs are stable across rename and move. Matching
-  // on checksum can misidentify a different same-content file.
+  // Remote rename: the Worker preserves the stable file ID while moving the
+  // R2 object to a new key.
   for (const del of deleteLocals) {
     const b = base[del.path];
     if (!b?.fileId) continue;

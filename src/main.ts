@@ -5,13 +5,17 @@ import {
   Notice,
   Plugin,
   PluginSettingTab,
+  SecretComponent,
   Setting,
   TFile,
   normalizePath,
 } from "obsidian";
-import { DriveClient, DriveEndpoints, DriveTokens } from "./drive";
-import { startLoopbackAuth } from "./auth";
-import { ConnectWizard } from "./wizard";
+import {
+  R2Client,
+  type R2File,
+  type R2HistoryPage,
+  type R2HistoryVersion,
+} from "./r2";
 import { BaseEntry, LocalEntry, RemoteEntry, planSync } from "./planner";
 import { mergeTextPreservingBoth } from "./conflict";
 import {
@@ -27,29 +31,31 @@ import {
 import {
   decryptConnectionPayload,
   encryptConnectionPayload,
-  importedTokens,
   presentConnectionCode,
 } from "./connection";
 
-export interface DriveMergeSettings {
-  clientId: string;
-  clientSecret: string;
-  driveFolderName: string;
+export interface R2SyncSettings {
+  workerUrl: string;
+  vaultId: string;
+  tokenSecretId: string;
+  deviceId: string;
   syncOnStartup: boolean;
   excludedFolders: string[];
 }
 
-const DEFAULT_SETTINGS: DriveMergeSettings = {
-  clientId: "",
-  clientSecret: "",
-  driveFolderName: "",
+const DEFAULT_SETTINGS: R2SyncSettings = {
+  workerUrl: "",
+  vaultId: "owen-mobile",
+  tokenSecretId: "owen-r2-sync-token",
+  deviceId: "",
   syncOnStartup: true,
   excludedFolders: [],
 };
 
-// Serial transfers keep mobile memory bounded and make state checkpoints
-// strictly ordered. The drained-worker structure still prevents orphan work.
-const TRANSFER_CONCURRENCY = 1;
+const SMALL_FILE_CONCURRENCY = 6;
+const MEDIUM_FILE_CONCURRENCY = 2;
+const LARGE_FILE_THRESHOLD = 8 * 1024 * 1024;
+const MEDIUM_FILE_THRESHOLD = 1024 * 1024;
 
 interface SyncJournal {
   identity: string;
@@ -58,8 +64,8 @@ interface SyncJournal {
 }
 
 interface PersistedData {
-  settings: DriveMergeSettings;
-  tokens: DriveTokens | null;
+  schemaVersion: 2;
+  settings: R2SyncSettings;
   rootFolderId: string | null;
   base: Record<string, BaseEntry>;
   baselineIdentity: string | null;
@@ -80,6 +86,11 @@ interface PlanSnapshot {
   requiresApproval: boolean;
 }
 
+interface HistoryContext {
+  current: R2File;
+  page: R2HistoryPage;
+}
+
 const TEXT_EXTENSIONS = new Set(["md", "txt"]);
 
 function bytesEqual(a: ArrayBuffer, b: ArrayBuffer): boolean {
@@ -90,9 +101,8 @@ function bytesEqual(a: ArrayBuffer, b: ArrayBuffer): boolean {
   return true;
 }
 
-export default class DriveMergeSyncPlugin extends Plugin {
-  settings: DriveMergeSettings = DEFAULT_SETTINGS;
-  private tokens: DriveTokens | null = null;
+export default class R2SyncPlugin extends Plugin {
+  settings: R2SyncSettings = DEFAULT_SETTINGS;
   private rootFolderId: string | null = null;
   private base: Record<string, BaseEntry> = {};
   private baselineIdentity: string | null = null;
@@ -102,24 +112,41 @@ export default class DriveMergeSyncPlugin extends Plugin {
   private syncing = false;
   private editDebounceHandle: number | null = null;
   private approvalNoticeFingerprint: string | null = null;
+  private historyCapability: boolean | null = null;
   private seenViews = new WeakSet<object>();
   private headerButtons = new Set<HTMLElement>();
-  // Test hook: point the client at a mock Drive server instead of Google.
-  debugEndpoints: Partial<DriveEndpoints> | null = null;
 
   async onload() {
     await this.loadPersisted();
 
     this.statusEl = this.addStatusBarItem();
-    this.setStatus(this.tokens ? "ready" : "not connected");
+    this.setStatus(this.connected ? "ready" : "not connected");
 
-    this.addRibbonIcon("refresh-cw", "Sync with Google Drive", () =>
+    this.addRibbonIcon("refresh-cw", "Sync with Cloudflare R2", () =>
       void this.syncNow(false, "manual")
     );
     this.addCommand({
       id: "sync-now",
       name: "Sync now",
       callback: () => void this.syncNow(false, "manual"),
+    });
+    this.addCommand({
+      id: "active-file-version-history",
+      name: "Show version history for active file",
+      checkCallback: (checking) => {
+        const available = this.connected && this.historyCapability !== false;
+        if (available && !checking) void this.showActiveFileHistory();
+        return available;
+      },
+    });
+    this.addCommand({
+      id: "recover-recently-deleted",
+      name: "Recover a recently deleted file",
+      checkCallback: (checking) => {
+        const available = this.connected && this.historyCapability !== false;
+        if (available && !checking) void this.showRecentlyDeleted();
+        return available;
+      },
     });
     this.addCommand({
       id: "dry-run",
@@ -132,7 +159,7 @@ export default class DriveMergeSyncPlugin extends Plugin {
       callback: () => new BaselineResetModal(this.app, () => void this.resetBaseline()).open(),
     });
 
-    this.addSettingTab(new DriveMergeSettingTab(this));
+    this.addSettingTab(new R2SyncSettingTab(this));
 
     // One cloud button in every note pane header: sync when connected,
     // open the setup wizard when not.
@@ -141,7 +168,7 @@ export default class DriveMergeSyncPlugin extends Plugin {
     this.app.workspace.onLayoutReady(() => this.ensureHeaderButtons());
 
     this.registerDomEvent(document, "visibilitychange", () => {
-      if (document.visibilityState === "visible" && this.tokens) {
+      if (document.visibilityState === "visible" && this.connected) {
         void this.syncNow(false, "automatic");
       }
     });
@@ -154,7 +181,7 @@ export default class DriveMergeSyncPlugin extends Plugin {
       this.registerEvent(this.app.vault.on("rename", schedule));
     });
 
-    if (this.settings.syncOnStartup && this.tokens) {
+    if (this.settings.syncOnStartup && this.connected) {
       this.app.workspace.onLayoutReady(() =>
         window.setTimeout(() => void this.syncNow(false, "automatic"), 3000)
       );
@@ -168,7 +195,11 @@ export default class DriveMergeSyncPlugin extends Plugin {
   }
 
   get connected(): boolean {
-    return this.tokens !== null;
+    return Boolean(
+      this.settings.workerUrl &&
+      this.settings.vaultId &&
+      this.app.secretStorage.getSecret(this.settings.tokenSecretId)
+    );
   }
 
   private ensureHeaderButtons() {
@@ -177,9 +208,9 @@ export default class DriveMergeSyncPlugin extends Plugin {
         const view = leaf.view;
         if (!(view instanceof FileView) || this.seenViews.has(view)) continue;
         this.seenViews.add(view);
-        const el = view.addAction("cloud", "Sync with Google Drive", () => {
+        const el = view.addAction("cloud", "Sync with Cloudflare R2", () => {
           if (this.connected) void this.syncNow(false, "manual");
-          else new ConnectWizard(this).open();
+          else new Notice("Configure the Worker URL, vault ID, and sync token in Owen R2 Sync settings.");
         });
         this.headerButtons.add(el);
       }
@@ -187,7 +218,7 @@ export default class DriveMergeSyncPlugin extends Plugin {
   }
 
   private scheduleEditSync() {
-    if (!this.tokens || !this.firstSyncApproved || document.visibilityState !== "visible") {
+    if (!this.connected || !this.firstSyncApproved || document.visibilityState !== "visible") {
       return;
     }
     if (this.editDebounceHandle !== null) window.clearTimeout(this.editDebounceHandle);
@@ -199,19 +230,35 @@ export default class DriveMergeSyncPlugin extends Plugin {
 
   private async loadPersisted() {
     const raw = (await this.loadData()) as Partial<PersistedData> | null;
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, raw?.settings);
-    this.tokens = raw?.tokens ?? null;
-    this.rootFolderId = raw?.rootFolderId ?? null;
-    this.base = raw?.base ?? {};
-    this.baselineIdentity = raw?.baselineIdentity ?? null;
-    this.firstSyncApproved = raw?.firstSyncApproved ?? false;
-    this.journal = raw?.journal ?? null;
+    const previousSettings = raw?.settings as Partial<R2SyncSettings> | undefined;
+    this.settings = {
+      workerUrl: typeof previousSettings?.workerUrl === "string" ? previousSettings.workerUrl : "",
+      vaultId: typeof previousSettings?.vaultId === "string" ? previousSettings.vaultId : DEFAULT_SETTINGS.vaultId,
+      tokenSecretId: typeof previousSettings?.tokenSecretId === "string"
+        ? previousSettings.tokenSecretId
+        : DEFAULT_SETTINGS.tokenSecretId,
+      deviceId: typeof previousSettings?.deviceId === "string" ? previousSettings.deviceId : "",
+      syncOnStartup: typeof previousSettings?.syncOnStartup === "boolean"
+        ? previousSettings.syncOnStartup
+        : DEFAULT_SETTINGS.syncOnStartup,
+      excludedFolders: Array.isArray(previousSettings?.excludedFolders)
+        ? previousSettings.excludedFolders.filter((value): value is string => typeof value === "string")
+        : [],
+    };
+    if (!this.settings.deviceId) this.settings.deviceId = crypto.randomUUID();
+    const compatible = raw?.schemaVersion === 2;
+    this.rootFolderId = compatible ? raw?.rootFolderId ?? null : null;
+    this.base = compatible ? raw?.base ?? {} : {};
+    this.baselineIdentity = compatible ? raw?.baselineIdentity ?? null : null;
+    this.firstSyncApproved = compatible ? raw?.firstSyncApproved ?? false : false;
+    this.journal = compatible ? raw?.journal ?? null : null;
+    if (!compatible) await this.persist();
   }
 
   async persist() {
     const data: PersistedData = {
+      schemaVersion: 2,
       settings: this.settings,
-      tokens: this.tokens,
       rootFolderId: this.rootFolderId,
       base: this.base,
       baselineIdentity: this.baselineIdentity,
@@ -222,30 +269,28 @@ export default class DriveMergeSyncPlugin extends Plugin {
   }
 
   private setStatus(text: string) {
-    this.statusEl?.setText(`Drive: ${text}`);
+    this.statusEl?.setText(`R2: ${text}`);
   }
 
   // ---- Connection -----------------------------------------------------------
 
   async exportConnectionCode(passphrase: string): Promise<string | null> {
-    if (!this.tokens) return null;
+    const apiToken = this.app.secretStorage.getSecret(this.settings.tokenSecretId);
+    if (!apiToken || !this.settings.workerUrl || !this.settings.vaultId) return null;
     return encryptConnectionPayload({
-      clientId: this.settings.clientId,
-      clientSecret: this.settings.clientSecret,
-      refreshToken: this.tokens.refreshToken,
-      rootFolderId: this.rootFolderId,
-      driveFolderName: this.settings.driveFolderName,
+      workerUrl: this.settings.workerUrl,
+      apiToken,
+      vaultId: this.settings.vaultId,
     }, passphrase);
   }
 
   async importConnectionCode(code: string, passphrase: string): Promise<boolean> {
     try {
       const payload = await decryptConnectionPayload(code, passphrase);
-      this.settings.clientId = payload.clientId;
-      this.settings.clientSecret = payload.clientSecret;
-      this.settings.driveFolderName = payload.driveFolderName;
-      this.tokens = importedTokens(payload);
-      this.rootFolderId = payload.rootFolderId;
+      this.settings.workerUrl = payload.workerUrl;
+      this.settings.vaultId = payload.vaultId;
+      this.app.secretStorage.setSecret(this.settings.tokenSecretId, payload.apiToken);
+      this.rootFolderId = payload.vaultId;
       this.base = {};
       this.baselineIdentity = null;
       this.firstSyncApproved = false;
@@ -255,69 +300,42 @@ export default class DriveMergeSyncPlugin extends Plugin {
       this.setStatus("connected");
       return true;
     } catch (error) {
-      console.error("Owen Google Drive Sync: connection code rejected", error);
+      console.error("Owen R2 Sync: connection code rejected", error);
       return false;
     }
   }
 
-  async connect() {
-    if (!this.settings.clientId || !this.settings.clientSecret) {
-      new ConnectWizard(this).open();
-      return;
+  async testConnection() {
+    const client = this.client();
+    if (!client) {
+      new Notice("Configure the Worker URL, vault ID, and sync token first.");
+      return false;
     }
     try {
-      const result = await startLoopbackAuth(this.settings.clientId, (url) => {
-        window.open(url);
-        new Notice("Complete the Google sign-in in your browser.");
-      });
-      this.tokens = await DriveClient.exchangeCode(
-        this.settings.clientId,
-        this.settings.clientSecret,
-        result.code,
-        result.redirectUri,
-        result.codeVerifier
-      );
-      this.rootFolderId = null;
-      this.base = {};
-      this.baselineIdentity = null;
-      this.firstSyncApproved = false;
-      this.journal = null;
-      await this.clearBaselineFiles();
-      await this.persist();
-      this.setStatus("connected");
-      new Notice("Google Drive connected.");
+      const health = await client.health();
+      this.historyCapability = health.historyProtocol === 1;
+      this.setStatus("ready");
+      new Notice("Cloudflare R2 Worker connection verified.");
+      return true;
     } catch (e) {
-      console.error("Owen Google Drive Sync: auth failed", e);
-      new Notice(`Google sign-in failed: ${e instanceof Error ? e.message : e}`);
+      console.error("Owen R2 Sync: connection failed", e);
+      this.setStatus("connection failed");
+      new Notice(`R2 connection failed: ${e instanceof Error ? e.message : e}`);
+      return false;
     }
   }
 
   async disconnect() {
-    const refreshToken = this.tokens?.refreshToken;
-    let revokeError: unknown = null;
-    if (refreshToken) {
-      try {
-        await DriveClient.revokeToken(refreshToken, this.debugEndpoints?.revoke);
-      } catch (error) {
-        revokeError = error;
-      }
-    }
-    this.tokens = null;
+    this.app.secretStorage.setSecret(this.settings.tokenSecretId, "");
     this.rootFolderId = null;
     this.base = {};
     this.baselineIdentity = null;
     this.firstSyncApproved = false;
     this.journal = null;
-    this.settings.clientId = "";
-    this.settings.clientSecret = "";
+    this.historyCapability = null;
     await this.clearBaselineFiles();
     await this.persist();
     this.setStatus("not connected");
-    if (revokeError) {
-      new Notice(
-        "Local credentials were removed, but Google revocation could not be confirmed. Remove the app at myaccount.google.com/permissions."
-      );
-    }
   }
 
   async resetBaseline() {
@@ -329,22 +347,165 @@ export default class DriveMergeSyncPlugin extends Plugin {
     this.approvalNoticeFingerprint = null;
     await this.clearBaselineFiles();
     await this.persist();
-    this.setStatus(this.tokens ? "preview required" : "not connected");
+    this.setStatus(this.connected ? "preview required" : "not connected");
     new Notice("Sync baseline reset. The next sync is a read-only first-sync preview.");
   }
 
-  private client(): DriveClient | null {
-    if (!this.tokens) return null;
-    return new DriveClient(
-      this.settings.clientId,
-      this.settings.clientSecret,
-      this.tokens,
-      (t) => {
-        this.tokens = t;
-        void this.persist();
-      },
-      this.debugEndpoints ?? undefined
+  private client(): R2Client | null {
+    const token = this.app.secretStorage.getSecret(this.settings.tokenSecretId);
+    if (!token || !this.settings.workerUrl || !this.settings.vaultId) return null;
+    return new R2Client(
+      this.settings.workerUrl,
+      this.settings.vaultId,
+      token,
+      this.settings.deviceId
     );
+  }
+
+  private async historyClient(): Promise<R2Client | null> {
+    const r2 = this.client();
+    if (!r2) {
+      new Notice("Configure the Worker URL, vault ID, and sync token first.");
+      return null;
+    }
+    try {
+      const health = await r2.health();
+      this.historyCapability = health.historyProtocol === 1;
+      if (!this.historyCapability) {
+        new Notice("This Worker does not support version history. Normal sync is still available.");
+        return null;
+      }
+      return r2;
+    } catch (error) {
+      new Notice(`Could not open R2 history: ${error instanceof Error ? error.message : error}`);
+      return null;
+    }
+  }
+
+  private async showActiveFileHistory() {
+    const active = this.app.workspace.getActiveFile();
+    if (!(active instanceof TFile)) {
+      new Notice("Open a synced file before viewing version history.");
+      return;
+    }
+    const r2 = await this.historyClient();
+    if (!r2) return;
+    try {
+      const tree = await r2.listTree(this.settings.vaultId);
+      const current = tree.get(active.path);
+      if (!current) {
+        new Notice("The active file is not a live R2 sync entry.");
+        return;
+      }
+      const page = await r2.listHistory(current.id, 50);
+      new HistoryVersionsModal(this, { current, page }, `Version history: ${active.path}`).open();
+    } catch (error) {
+      new Notice(`Could not load version history: ${error instanceof Error ? error.message : error}`);
+    }
+  }
+
+  private async showRecentlyDeleted() {
+    const r2 = await this.historyClient();
+    if (!r2) return;
+    try {
+      await r2.listTree(this.settings.vaultId);
+      const deleted = r2.deletedFiles();
+      if (deleted.length === 0) {
+        new Notice("No recently deleted R2 files are recoverable.");
+        return;
+      }
+      new RecentlyDeletedModal(this, deleted).open();
+    } catch (error) {
+      new Notice(`Could not load deleted files: ${error instanceof Error ? error.message : error}`);
+    }
+  }
+
+  async openHistoryForCurrent(current: R2File, title?: string) {
+    const r2 = await this.historyClient();
+    if (!r2) return;
+    try {
+      const page = await r2.listHistory(current.id, 50);
+      new HistoryVersionsModal(
+        this,
+        { current, page },
+        title ?? `Version history: ${current.path}`
+      ).open();
+    } catch (error) {
+      new Notice(`Could not load version history: ${error instanceof Error ? error.message : error}`);
+    }
+  }
+
+  async loadMoreHistory(fileId: string, cursor: string): Promise<R2HistoryPage | null> {
+    const r2 = await this.historyClient();
+    if (!r2) return null;
+    return r2.listHistory(fileId, 50, cursor);
+  }
+
+  async historyApprovalFingerprint(current: R2File, version: R2HistoryVersion): Promise<string> {
+    const bytes = new TextEncoder().encode(JSON.stringify({
+      fileId: current.id,
+      path: current.path,
+      currentRevision: current.revision,
+      versionId: version.versionId,
+      versionHash: version.sha256,
+      versionPath: version.path,
+      versionSourceRevision: version.sourceRevision,
+      versionSize: version.size,
+    }));
+    return sha256Hex(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+  }
+
+  async confirmHistoryRestore(current: R2File, version: R2HistoryVersion) {
+    const fingerprint = await this.historyApprovalFingerprint(current, version);
+    new HistoryRestoreModal(this, current, version, fingerprint).open();
+  }
+
+  async restoreHistoryVersion(
+    approvedCurrent: R2File,
+    approvedVersion: R2HistoryVersion,
+    approvedFingerprint: string
+  ): Promise<boolean> {
+    if (this.syncing) {
+      new Notice("Wait for the current sync or restore to finish.");
+      return false;
+    }
+    let restored = false;
+    this.syncing = true;
+    try {
+      const r2 = await this.historyClient();
+      if (!r2) return false;
+      this.setStatus("restoring history…");
+      await r2.listTree(this.settings.vaultId);
+      const current = r2.currentFile(approvedCurrent.id);
+      if (
+        !current ||
+        current.path !== approvedCurrent.path ||
+        current.revision !== approvedCurrent.revision ||
+        current.deleted !== approvedCurrent.deleted
+      ) {
+        throw new Error("The current R2 file changed after approval. Reopen history and review again.");
+      }
+      const version = await r2.headHistory(
+        approvedVersion.fileId,
+        approvedVersion.versionId,
+        approvedVersion
+      );
+      const fingerprint = await this.historyApprovalFingerprint(current, version);
+      if (fingerprint !== approvedFingerprint) {
+        throw new Error("The selected history restore fingerprint changed. Reopen history and review again.");
+      }
+      await r2.restoreHistory(version, current);
+      restored = true;
+      this.setStatus("history restored remotely");
+      new Notice("R2 history was restored. Running normal sync to preserve any local edits.");
+    } catch (error) {
+      this.setStatus("history restore stopped");
+      new Notice(`History restore stopped: ${error instanceof Error ? error.message : error}`);
+    } finally {
+      this.syncing = false;
+    }
+    if (restored) await this.syncNow(false, "manual");
+    return restored;
   }
 
   // ---- Sync -----------------------------------------------------------------
@@ -372,15 +533,17 @@ export default class DriveMergeSyncPlugin extends Plugin {
       if (trigger === "manual") new Notice("A sync is already running.");
       return;
     }
-    const drive = this.client();
-    if (!drive) {
-      if (trigger === "manual") new ConnectWizard(this).open();
+    const r2 = this.client();
+    if (!r2) {
+      if (trigger === "manual") {
+        new Notice("Configure the Worker URL, vault ID, and sync token in Owen R2 Sync settings.");
+      }
       return;
     }
     this.syncing = true;
     this.setStatus(dryRun ? "previewing…" : "syncing…");
     try {
-      const snapshot = await this.preparePlan(drive);
+      const snapshot = await this.preparePlan(r2);
       const approvalChanged =
         approvedFingerprint !== undefined && approvedFingerprint !== snapshot.fingerprint;
       if (dryRun || approvalChanged || (snapshot.requiresApproval && !approvedFingerprint)) {
@@ -389,31 +552,29 @@ export default class DriveMergeSyncPlugin extends Plugin {
           this.showPreview(snapshot);
         } else if (this.approvalNoticeFingerprint !== snapshot.fingerprint) {
           this.approvalNoticeFingerprint = snapshot.fingerprint;
-          new Notice("Drive sync is paused for review. Run the preview command to approve it.");
+          new Notice("R2 sync is paused for review. Run the preview command to approve it.");
         }
         return;
       }
       this.approvalNoticeFingerprint = null;
-      await this.executeSnapshot(drive, snapshot);
+      await this.executeSnapshot(r2, snapshot);
     } catch (e) {
-      console.error("Owen Google Drive Sync failed", e);
+      console.error("Owen R2 Sync failed", e);
       this.setStatus("sync failed");
-      new Notice(`Drive sync failed: ${e instanceof Error ? e.message : e}`);
+      new Notice(`R2 sync failed: ${e instanceof Error ? e.message : e}`);
     } finally {
       this.syncing = false;
     }
   }
 
-  private async preparePlan(drive: DriveClient): Promise<PlanSnapshot> {
+  private async preparePlan(r2: R2Client): Promise<PlanSnapshot> {
     assertTargetVault(this.app.vault.getName());
-    const folderName = this.settings.driveFolderName.trim() || this.app.vault.getName();
-    let rootId = this.rootFolderId;
-    if (rootId) await drive.verifyFolder(rootId);
-    else rootId = await drive.findFolder(folderName);
+    const rootId = this.settings.vaultId;
+    await r2.verifyFolder(rootId);
 
-    const identity = rootId ? `${this.app.vault.getName()}:${rootId}` : null;
+    const identity = `${this.app.vault.getName()}:${this.settings.workerUrl}:${rootId}`;
     const firstSync =
-      !this.firstSyncApproved || !identity || this.baselineIdentity !== identity;
+      !this.firstSyncApproved || this.baselineIdentity !== identity;
     const baseSource = firstSync ? {} : this.base;
     const base = Object.fromEntries(
       Object.entries(baseSource).filter(([path]) => !this.excluded(path))
@@ -443,7 +604,7 @@ export default class DriveMergeSyncPlugin extends Plugin {
 
     const remote: Record<string, RemoteEntry> = {};
     if (rootId) {
-      for (const [path, file] of await drive.listTree(rootId)) {
+      for (const [path, file] of await r2.listTree(rootId)) {
         if (isMandatoryExcluded(path, this.app.vault.configDir)) {
           mandatoryExcludedPaths.add(path);
           continue;
@@ -451,9 +612,10 @@ export default class DriveMergeSyncPlugin extends Plugin {
         if (this.excluded(path)) continue;
         remote[path] = {
           fileId: file.id,
-          rev: file.md5Checksum ?? file.modifiedTime ?? "",
+          rev: file.revision,
           size: Number(file.size ?? 0),
           mtime: file.modifiedTime ? Date.parse(file.modifiedTime) : undefined,
+          hash: file.md5Checksum,
         };
       }
     }
@@ -474,7 +636,7 @@ export default class DriveMergeSyncPlugin extends Plugin {
     }
     if (this.journal) warnings.push("A previous run was interrupted; this plan was rebuilt from current state.");
     const fingerprint = [
-      identity ?? `new:${folderName}`,
+      identity,
       actionFingerprint(actions),
       JSON.stringify(Object.entries(local).sort()),
       JSON.stringify(Object.entries(remote).sort()),
@@ -489,7 +651,7 @@ export default class DriveMergeSyncPlugin extends Plugin {
       fingerprint,
       firstSync,
       warnings,
-      requiresApproval: safety.requiresApproval || this.journal !== null,
+      requiresApproval: safety.requiresApproval,
     };
   }
 
@@ -499,12 +661,11 @@ export default class DriveMergeSyncPlugin extends Plugin {
     }).open();
   }
 
-  private async executeSnapshot(drive: DriveClient, snapshot: PlanSnapshot) {
-    const folderName = this.settings.driveFolderName.trim() || this.app.vault.getName();
-    const rootId = snapshot.rootId ?? (await drive.ensureFolder(folderName));
-    await drive.verifyFolder(rootId);
+  private async executeSnapshot(r2: R2Client, snapshot: PlanSnapshot) {
+    const rootId = this.settings.vaultId;
+    await r2.verifyFolder(rootId);
     this.rootFolderId = rootId;
-    const identity = `${this.app.vault.getName()}:${rootId}`;
+    const identity = `${this.app.vault.getName()}:${this.settings.workerUrl}:${rootId}`;
     this.base = snapshot.base;
     this.journal = { identity, fingerprint: snapshot.fingerprint, startedAt: Date.now() };
     await this.persist();
@@ -518,14 +679,14 @@ export default class DriveMergeSyncPlugin extends Plugin {
       if (action.kind === "uploadNew" || action.kind === "uploadUpdate") {
         const folders = action.path.split("/");
         folders.pop();
-        if (folders.length) await drive.ensurePath(rootId, folders, folderCache);
+        if (folders.length) await r2.ensurePath(rootId, folders, folderCache);
       }
     }
 
     const runAction = async (action: ReturnType<typeof planSync>[number]) => {
       this.setStatus(`syncing ${++done}/${snapshot.actions.length}…`);
       await this.execute(
-        drive,
+        r2,
         action,
         folderCache,
         snapshot.remote,
@@ -538,20 +699,32 @@ export default class DriveMergeSyncPlugin extends Plugin {
     for (const action of serial) await runAction(action);
 
     const queue = [...transfers];
+    const transferConcurrency = this.transferConcurrency(transfers, snapshot);
     let firstFailure: unknown = null;
+    let checkpoint = Promise.resolve();
     const worker = async () => {
       while (firstFailure === null) {
         const action = queue.shift();
         if (!action) return;
         try {
-          await runAction(action);
+          this.setStatus(`syncing ${++done}/${snapshot.actions.length}…`);
+          await this.execute(
+            r2,
+            action,
+            folderCache,
+            snapshot.remote,
+            snapshot.local,
+            () => conflictsPreserved++
+          );
+          checkpoint = checkpoint.then(() => this.persist());
+          await checkpoint;
         } catch (error) {
           if (firstFailure === null) firstFailure = error;
         }
       }
     };
     await Promise.allSettled(
-      Array.from({ length: Math.min(TRANSFER_CONCURRENCY, queue.length) }, worker)
+      Array.from({ length: Math.min(transferConcurrency, queue.length) }, worker)
     );
     if (firstFailure) {
       throw firstFailure instanceof Error
@@ -562,7 +735,12 @@ export default class DriveMergeSyncPlugin extends Plugin {
     // Destructive effects are last, after all preservation/transfers succeeded.
     for (const action of deletes) await runAction(action);
 
-    await this.rebuildBase(drive);
+    for (const path of Object.keys(this.base)) {
+      if (!snapshot.local[path] && !snapshot.remote[path]) {
+        delete this.base[path];
+        await this.deleteBaseCopy(path);
+      }
+    }
     this.baselineIdentity = identity;
     this.firstSyncApproved = true;
     this.journal = null;
@@ -570,11 +748,29 @@ export default class DriveMergeSyncPlugin extends Plugin {
     this.setStatus(`synced ${new Date().toLocaleTimeString()}`);
     if (snapshot.actions.length > 0) {
       new Notice(
-        `Drive sync: ${snapshot.actions.length} change(s)${
-          conflictsPreserved ? `, ${conflictsPreserved} conflict(s) preserved` : ""
-        }.`
+        `R2 sync: ${snapshot.actions.length} change(s)${
+          deletes.length ? `, ${deletes.length} delete(s)` : ""
+        }${conflictsPreserved ? `, ${conflictsPreserved} conflict(s) preserved` : ""}.`
       );
     }
+  }
+
+  private transferConcurrency(
+    actions: ReturnType<typeof planSync>,
+    snapshot: PlanSnapshot
+  ): number {
+    let largest = 0;
+    for (const action of actions) {
+      if (!("path" in action)) continue;
+      largest = Math.max(
+        largest,
+        snapshot.local[action.path]?.size ?? 0,
+        snapshot.remote[action.path]?.size ?? 0
+      );
+    }
+    if (largest >= LARGE_FILE_THRESHOLD) return 1;
+    if (largest >= MEDIUM_FILE_THRESHOLD) return MEDIUM_FILE_CONCURRENCY;
+    return SMALL_FILE_CONCURRENCY;
   }
 
   private baseDir(): string {
@@ -695,7 +891,7 @@ export default class DriveMergeSyncPlugin extends Plugin {
   }
 
   private async execute(
-    drive: DriveClient,
+    r2: R2Client,
     action: ReturnType<typeof planSync>[number],
     folderCache: Map<string, string>,
     remote: Record<string, RemoteEntry>,
@@ -703,22 +899,47 @@ export default class DriveMergeSyncPlugin extends Plugin {
     onMerge: () => void
   ) {
     const rootId = this.rootFolderId;
-    if (!rootId) throw new Error("Drive folder is not initialized yet.");
+    if (!rootId) throw new Error("R2 vault is not initialized yet.");
     const actionPath = "path" in action ? action.path : action.to;
     const parts = actionPath.split("/");
     const name = parts.pop();
     if (!name) return;
 
     switch (action.kind) {
+      case "adopt": {
+        const file = await this.assertLocalSnapshot(action.path, local[action.path]);
+        const remoteEntry = remote[action.path];
+        if (!(file instanceof TFile) || !remoteEntry) {
+          throw new Error(`${action.path}: adoption inputs changed after planning.`);
+        }
+        const bytes = await this.app.vault.readBinary(file);
+        const localHash = await sha256Hex(bytes);
+        if (!remoteEntry.hash || localHash !== remoteEntry.hash) {
+          throw new Error(`${action.path}: adoption hash changed after planning.`);
+        }
+        const stat = await this.freshStat(file);
+        this.base[action.path] = {
+          fileId: action.fileId,
+          localMtime: stat.mtime,
+          localSize: stat.size,
+          localHash,
+          remoteRev: remoteEntry.rev,
+        };
+        if (this.isTextPath(action.path)) {
+          await this.writeBaseCopy(action.path, await this.app.vault.read(file));
+        }
+        return;
+      }
+
       case "renameRemote": {
         await this.assertLocalSnapshot(action.from, local[action.from]);
         const current = await this.assertLocalSnapshot(action.to, local[action.to]);
         const toParts = action.to.split("/");
         const toName = toParts.pop();
         if (!toName) return;
-        const parentId = await drive.ensurePath(rootId, toParts, folderCache);
+        const parentId = await r2.ensurePath(rootId, toParts, folderCache);
         await this.assertLocalSnapshot(action.to, local[action.to]);
-        await drive.move(
+        const moved = await r2.move(
           action.fileId,
           toName,
           parentId,
@@ -732,7 +953,7 @@ export default class DriveMergeSyncPlugin extends Plugin {
           localMtime: f instanceof TFile ? f.stat.mtime : entry?.localMtime ?? 0,
           localSize: f instanceof TFile ? f.stat.size : entry?.localSize,
           localHash: entry?.localHash,
-          remoteRev: entry?.remoteRev ?? "",
+          remoteRev: moved.revision,
         };
         await this.moveBaseCopy(action.from, action.to);
         return;
@@ -752,7 +973,7 @@ export default class DriveMergeSyncPlugin extends Plugin {
         let f = this.app.vault.getAbstractFileByPath(action.to);
         if (action.remoteChanged && f instanceof TFile) {
           const remoteEntry = remote[action.to];
-          const bytes = await drive.download(
+          const bytes = await r2.download(
             action.fileId,
             remoteEntry?.rev,
             action.remoteSize
@@ -774,7 +995,7 @@ export default class DriveMergeSyncPlugin extends Plugin {
           localMtime: stat?.mtime ?? 0,
           localSize: stat?.size,
           localHash: localBytes ? await sha256Hex(localBytes) : entry?.localHash,
-          remoteRev: entry?.remoteRev ?? "",
+          remoteRev: remote[action.to]?.rev ?? entry?.remoteRev ?? "",
         };
         return;
       }
@@ -789,14 +1010,16 @@ export default class DriveMergeSyncPlugin extends Plugin {
         if (expected?.hash && localHash !== expected.hash) {
           throw new Error(`${action.path}: local file changed after planning.`);
         }
-        const parentId = await drive.ensurePath(rootId, parts, folderCache);
+        const parentId = await r2.ensurePath(rootId, parts, folderCache);
         await this.assertLocalSnapshot(action.path, expected, false);
-        const uploaded = await drive.upload(
+        const uploaded = await r2.upload(
           name,
           parentId,
           content,
           action.kind === "uploadUpdate" ? action.fileId : undefined,
-          action.kind === "uploadUpdate" ? remote[action.path]?.rev : undefined
+          action.kind === "uploadUpdate" ? remote[action.path]?.rev : undefined,
+          localHash,
+          expected?.mtime ?? Date.now()
         );
         await this.assertLocalSnapshot(action.path, expected, false);
         const stableStat = await this.freshStat(file);
@@ -805,7 +1028,7 @@ export default class DriveMergeSyncPlugin extends Plugin {
           localMtime: stableStat.mtime,
           localSize: stableStat.size,
           localHash,
-          remoteRev: uploaded.md5Checksum ?? "",
+          remoteRev: uploaded.revision,
         };
         if (this.isTextPath(action.path)) {
           await this.writeBaseCopy(action.path, await this.app.vault.read(file));
@@ -817,7 +1040,7 @@ export default class DriveMergeSyncPlugin extends Plugin {
       case "downloadUpdate": {
         await this.assertLocalSnapshot(action.path, local[action.path]);
         const remoteEntry = remote[action.path];
-        const bytes = await drive.download(
+        const bytes = await r2.download(
           action.fileId,
           remoteEntry?.rev,
           remoteEntry?.size
@@ -838,7 +1061,7 @@ export default class DriveMergeSyncPlugin extends Plugin {
             localMtime: st.mtime,
             localSize: st.size,
             localHash: await sha256Hex(bytes),
-            remoteRev: "", // filled by rebuildBase
+            remoteRev: remoteEntry?.rev ?? "",
           };
           if (this.isTextPath(action.path)) {
             await this.writeBaseCopy(action.path, await this.app.vault.read(f));
@@ -858,7 +1081,7 @@ export default class DriveMergeSyncPlugin extends Plugin {
 
       case "deleteRemote": {
         await this.assertLocalSnapshot(action.path, local[action.path]);
-        await drive.trash(action.fileId, remote[action.path]?.rev);
+        await r2.trash(action.fileId, remote[action.path]?.rev);
         delete this.base[action.path];
         await this.deleteBaseCopy(action.path);
         return;
@@ -866,7 +1089,7 @@ export default class DriveMergeSyncPlugin extends Plugin {
 
       case "conflict": {
         await this.resolveConflict(
-          drive,
+          r2,
           action.path,
           action.fileId,
           folderCache,
@@ -882,7 +1105,7 @@ export default class DriveMergeSyncPlugin extends Plugin {
   // Both inputs always remain recoverable. Text conflicts use explicit
   // markers; binary conflicts keep the local input as a sibling copy.
   private async resolveConflict(
-    drive: DriveClient,
+    r2: R2Client,
     path: string,
     fileId: string,
     folderCache: Map<string, string>,
@@ -893,7 +1116,7 @@ export default class DriveMergeSyncPlugin extends Plugin {
     const file = await this.assertLocalSnapshot(path, localEntry);
     if (!(file instanceof TFile)) throw new Error(`${path}: conflict source is missing.`);
 
-    const remoteBytes = await drive.download(fileId, remoteEntry?.rev, remoteEntry?.size);
+    const remoteBytes = await r2.download(fileId, remoteEntry?.rev, remoteEntry?.size);
     await this.assertLocalSnapshot(path, localEntry);
     const localBytes = await this.app.vault.readBinary(file);
 
@@ -905,7 +1128,7 @@ export default class DriveMergeSyncPlugin extends Plugin {
         localMtime: file.stat.mtime,
         localSize: file.stat.size,
         localHash: await sha256Hex(localBytes),
-        remoteRev: "", // filled by rebuildBase
+        remoteRev: remoteEntry?.rev ?? "",
       };
       if (this.isTextPath(path)) {
         await this.writeBaseCopy(path, await this.app.vault.read(file));
@@ -919,11 +1142,11 @@ export default class DriveMergeSyncPlugin extends Plugin {
       const baseText = await this.readBaseCopy(path);
       const result = mergeTextPreservingBoth(baseText, localText, remoteText);
       if (result.preserveRemoteCopy) {
-        await this.createConflictCopy(path, "Drive", remoteBytes);
+        await this.createConflictCopy(path, "R2", remoteBytes);
       }
       await this.app.vault.modify(file, result.content);
       await this.finishConflict(
-        drive,
+        r2,
         path,
         fileId,
         result.content,
@@ -934,7 +1157,7 @@ export default class DriveMergeSyncPlugin extends Plugin {
       if (result.conflicts > 0) {
         onMerge();
         new Notice(
-          `${path}: both versions were preserved with conflict markers and a Drive copy.`
+          `${path}: both versions were preserved with conflict markers and an R2 copy.`
         );
       }
       return;
@@ -948,14 +1171,14 @@ export default class DriveMergeSyncPlugin extends Plugin {
       localMtime: st.mtime,
       localSize: st.size,
       localHash: await sha256Hex(remoteBytes),
-      remoteRev: "", // filled by rebuildBase
+      remoteRev: remoteEntry?.rev ?? "",
     };
     onMerge();
   }
 
   private async createConflictCopy(
     path: string,
-    source: "Drive" | "Local",
+    source: "R2" | "Local",
     bytes: ArrayBuffer
   ): Promise<string> {
     const digestMarker = Number.parseInt((await sha256Hex(bytes)).slice(0, 12), 16);
@@ -986,7 +1209,7 @@ export default class DriveMergeSyncPlugin extends Plugin {
   }
 
   private async finishConflict(
-    drive: DriveClient,
+    r2: R2Client,
     path: string,
     fileId: string,
     content: string,
@@ -998,24 +1221,27 @@ export default class DriveMergeSyncPlugin extends Plugin {
     const name = parts.pop();
     const rootId = this.rootFolderId;
     if (!name || !rootId) return;
-    const parentId = await drive.ensurePath(rootId, parts, folderCache);
+    const parentId = await r2.ensurePath(rootId, parts, folderCache);
     const bytes = new TextEncoder().encode(content);
     const body = new ArrayBuffer(bytes.byteLength);
     new Uint8Array(body).set(bytes);
-    const up = await drive.upload(
+    const st = await this.freshStat(file);
+    const contentHash = await sha256Hex(body);
+    const up = await r2.upload(
       name,
       parentId,
       body,
       fileId,
-      expectedRemoteRevision
+      expectedRemoteRevision,
+      contentHash,
+      st.mtime
     );
-    const st = await this.freshStat(file);
     this.base[path] = {
       fileId: up.id,
       localMtime: st.mtime,
       localSize: st.size,
-      localHash: await sha256Hex(body),
-      remoteRev: up.md5Checksum ?? "",
+      localHash: contentHash,
+      remoteRev: up.revision,
     };
     await this.writeBaseCopy(path, content);
   }
@@ -1030,25 +1256,161 @@ export default class DriveMergeSyncPlugin extends Plugin {
     }
   }
 
-  // After executing, re-list the remote so base holds true revisions.
-  private async rebuildBase(drive: DriveClient) {
-    const rootId = this.rootFolderId;
-    if (!rootId) return;
-    const remoteTree = await drive.listTree(rootId);
-    for (const [path, f] of remoteTree) {
-      if (this.excluded(path)) continue;
-      const entry = this.base[path];
-      if (entry) {
-        entry.fileId = f.id;
-        entry.remoteRev = f.md5Checksum ?? f.modifiedTime ?? "";
+}
+
+function formatHistoryTime(value: string | number): string {
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) ? date.toLocaleString() : "unknown time";
+}
+
+function formatHistorySize(size: number): string {
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KiB`;
+  return `${(size / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+class HistoryVersionsModal extends Modal {
+  private versions: R2HistoryVersion[];
+  private nextCursor: string | null;
+
+  constructor(
+    private plugin: R2SyncPlugin,
+    private context: HistoryContext,
+    private title: string
+  ) {
+    super(plugin.app);
+    this.versions = [...context.page.versions];
+    this.nextCursor = context.page.nextCursor;
+  }
+
+  onOpen() {
+    this.render();
+  }
+
+  private render() {
+    this.setTitle(this.title);
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("p", {
+      text: "History is read only until you explicitly approve a restore. Restores happen in R2 first; normal sync then safely reconciles the local file.",
+    });
+    const list = contentEl.createDiv({ cls: "ors-history-list" });
+    if (this.versions.length === 0) {
+      list.createDiv({ text: "No archived versions are available yet.", cls: "ors-history-empty" });
+    }
+    for (const version of this.versions) {
+      const row = list.createDiv({ cls: "ors-history-row" });
+      row.createDiv({
+        cls: "ors-history-primary",
+        text: `${formatHistoryTime(version.archivedAt)} · ${version.path}`,
+      });
+      row.createDiv({
+        cls: "ors-history-meta",
+        text: `${formatHistorySize(version.size)} · ${version.deviceId} · ${
+          version.deleted ? "deleted marker" : "restorable"
+        }`,
+      });
+      if (!version.deleted) {
+        new Setting(row).addButton((button) =>
+          button.setButtonText("Review restore").onClick(() => {
+            void this.plugin.confirmHistoryRestore(this.context.current, version);
+          })
+        );
       }
     }
-    for (const path of Object.keys(this.base)) {
-      if (!remoteTree.has(path) || this.excluded(path)) {
-        delete this.base[path];
-        await this.deleteBaseCopy(path);
-      }
+    const controls = new Setting(contentEl)
+      .addButton((button) => button.setButtonText("Close").onClick(() => this.close()));
+    if (this.nextCursor) {
+      controls.addButton((button) =>
+        button.setButtonText("Load older versions").onClick(async () => {
+          const cursor = this.nextCursor;
+          if (!cursor) return;
+          const page = await this.plugin.loadMoreHistory(this.context.current.id, cursor);
+          if (!page) return;
+          this.versions.push(...page.versions);
+          this.nextCursor = page.nextCursor;
+          this.render();
+        })
+      );
     }
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
+class RecentlyDeletedModal extends Modal {
+  constructor(private plugin: R2SyncPlugin, private deleted: R2File[]) {
+    super(plugin.app);
+  }
+
+  onOpen() {
+    this.setTitle("Recently deleted R2 files");
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("p", {
+      text: "Only the latest tombstone for each stable file identity is shown. Choose a file to review its live archived versions.",
+    });
+    const list = contentEl.createDiv({ cls: "ors-history-list" });
+    for (const current of this.deleted) {
+      const row = list.createDiv({ cls: "ors-history-row" });
+      row.createDiv({ cls: "ors-history-primary", text: current.path });
+      row.createDiv({
+        cls: "ors-history-meta",
+        text: `${formatHistoryTime(current.uploadedTime ?? current.modifiedTime)} · ${formatHistorySize(Number(current.size))}`,
+      });
+      new Setting(row).addButton((button) =>
+        button.setButtonText("Review versions").onClick(() => {
+          void this.plugin.openHistoryForCurrent(current, `Recover deleted file: ${current.path}`);
+        })
+      );
+    }
+    new Setting(contentEl).addButton((button) =>
+      button.setButtonText("Close").onClick(() => this.close())
+    );
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
+class HistoryRestoreModal extends Modal {
+  constructor(
+    private plugin: R2SyncPlugin,
+    private current: R2File,
+    private version: R2HistoryVersion,
+    private fingerprint: string
+  ) {
+    super(plugin.app);
+  }
+
+  onOpen() {
+    this.setTitle("Approve R2 history restore");
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("p", {
+      text: "This restores the selected version remotely, then runs the normal sync planner. It never writes history bytes directly into the local vault.",
+    });
+    const details = contentEl.createDiv({ cls: "ors-history-approval" });
+    details.createDiv({ text: `Path: ${this.current.path}` });
+    details.createDiv({ text: `Archived: ${formatHistoryTime(this.version.archivedAt)}` });
+    details.createDiv({ text: `Size: ${formatHistorySize(this.version.size)}` });
+    details.createDiv({ text: `Device: ${this.version.deviceId}` });
+    details.createDiv({ text: `Approval: ${this.fingerprint.slice(0, 16)}` });
+    new Setting(contentEl)
+      .addButton((button) => button.setButtonText("Cancel").onClick(() => this.close()))
+      .addButton((button) =>
+        button.setButtonText("Restore remotely").setCta().onClick(() => {
+          this.close();
+          void this.plugin.restoreHistoryVersion(this.current, this.version, this.fingerprint);
+        })
+      );
+  }
+
+  onClose() {
+    this.contentEl.empty();
   }
 }
 
@@ -1061,7 +1423,7 @@ class BaselineResetModal extends Modal {
     this.setTitle("Reset sync baseline");
     this.contentEl.empty();
     this.contentEl.createEl("p", {
-      text: "This keeps the Google connection but forgets the current folder and last-common baseline. The next sync is a read-only first-sync preview.",
+      text: "This keeps the R2 connection but forgets the current last-common baseline. The next sync is a read-only first-sync preview.",
     });
     new Setting(this.contentEl)
       .addButton((button) => button.setButtonText("Cancel").onClick(() => this.close()))
@@ -1089,16 +1451,16 @@ class SyncPreviewModal extends Modal {
   }
 
   onOpen() {
-    this.setTitle("Review Google Drive sync");
+    this.setTitle("Review Cloudflare R2 sync");
     const { contentEl } = this;
     contentEl.empty();
     contentEl.createEl("p", {
       text: `${this.snapshot.actions.length} action(s). Nothing changes until you approve.`,
     });
     for (const warning of this.snapshot.warnings) {
-      contentEl.createEl("p", { text: warning, cls: "ogds-preview-warning" });
+      contentEl.createEl("p", { text: warning, cls: "ors-preview-warning" });
     }
-    const list = contentEl.createDiv({ cls: "ogds-preview-list" });
+    const list = contentEl.createDiv({ cls: "ors-preview-list" });
     if (this.snapshot.actions.length === 0) {
       list.createDiv({ text: "Nothing to transfer. Approval records this as the first common baseline." });
     } else {
@@ -1128,7 +1490,7 @@ class ConnectionTransferModal extends Modal {
   private passphrase = "";
   private code = "";
 
-  constructor(private plugin: DriveMergeSyncPlugin) {
+  constructor(private plugin: R2SyncPlugin) {
     super(plugin.app);
   }
 
@@ -1137,7 +1499,7 @@ class ConnectionTransferModal extends Modal {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.createEl("p", {
-      text: "Use a passphrase of at least 12 characters on both devices. Codes expire after 15 minutes and do not contain an access token.",
+      text: "Use a passphrase of at least 12 characters on both devices. Codes expire after 15 minutes; the R2 sync token is encrypted inside the code and never saved as plain plugin data.",
     });
     new Setting(contentEl).setName("Transfer passphrase").addText((text) => {
       text.inputEl.type = "password";
@@ -1161,7 +1523,7 @@ class ConnectionTransferModal extends Modal {
           try {
             const code = await this.plugin.exportConnectionCode(this.passphrase);
             if (!code) {
-              new Notice("Connect Google Drive first.");
+              new Notice("Configure and verify the R2 Worker first.");
               return;
             }
             this.code = code;
@@ -1200,10 +1562,10 @@ class ConnectionTransferModal extends Modal {
 
 // ---- Settings ---------------------------------------------------------------
 
-class DriveMergeSettingTab extends PluginSettingTab {
-  plugin: DriveMergeSyncPlugin;
+class R2SyncSettingTab extends PluginSettingTab {
+  plugin: R2SyncPlugin;
 
-  constructor(plugin: DriveMergeSyncPlugin) {
+  constructor(plugin: R2SyncPlugin) {
     super(plugin.app, plugin);
     this.plugin = plugin;
   }
@@ -1213,41 +1575,47 @@ class DriveMergeSettingTab extends PluginSettingTab {
     containerEl.empty();
 
     new Setting(containerEl)
-      .setName("Set up")
-      .setDesc("The wizard walks through the one-time Google setup: four links, one paste, one sign-in.")
-      .addButton((b) =>
-        b.setButtonText("Open setup wizard").setCta().onClick(() => new ConnectWizard(this.plugin).open())
+      .setName("Cloudflare Worker URL")
+      .setDesc("HTTPS endpoint of the private Worker bound to the R2 bucket.")
+      .addText((text) =>
+        text
+          .setPlaceholder("https://owen-obsidian-r2-sync.example.workers.dev")
+          .setValue(this.plugin.settings.workerUrl)
+          .onChange(async (value) => {
+            this.plugin.settings.workerUrl = value.trim().replace(/\/$/, "");
+            await this.plugin.persist();
+          })
       );
 
     new Setting(containerEl)
-      .setName("Google client ID")
-      .setDesc(
-        "Filled automatically by the wizard; edit only if you manage credentials by hand. They stay on this machine."
-      )
-      .addText((t) =>
-        t.setValue(this.plugin.settings.clientId).onChange(async (v) => {
-          this.plugin.settings.clientId = v.trim();
+      .setName("R2 vault ID")
+      .setDesc("Lowercase namespace shared by Mac owen-brain and iPhone owen-mobile.")
+      .addText((text) =>
+        text.setValue(this.plugin.settings.vaultId).onChange(async (value) => {
+          this.plugin.settings.vaultId = value.trim();
           await this.plugin.persist();
         })
       );
 
     new Setting(containerEl)
-      .setName("Google client secret")
-      .addText((t) => {
-        t.inputEl.type = "password";
-        t.setValue(this.plugin.settings.clientSecret).onChange(async (v) => {
-          this.plugin.settings.clientSecret = v.trim();
+      .setName("Sync token")
+      .setDesc("Stored in Obsidian SecretStorage, not in this plugin's data.json.")
+      .addComponent((element) =>
+        new SecretComponent(this.app, element)
+          .setValue(this.plugin.settings.tokenSecretId)
+          .onChange(async (value) => {
+          this.plugin.settings.tokenSecretId = value;
           await this.plugin.persist();
-        });
-      });
+          })
+      );
 
     new Setting(containerEl)
-      .setName("Connect")
+      .setName("Connection")
       .setDesc(
-        "Opens Google sign-in on desktop. Disconnect revokes the shared refresh token and clears local credentials and baseline state."
+        "Test authentication and R2 access. Disconnect clears the local secret reference and baseline without mutating R2."
       )
       .addButton((b) =>
-        b.setButtonText("Connect Google Drive").setCta().onClick(() => void this.plugin.connect())
+        b.setButtonText("Test R2 connection").setCta().onClick(() => void this.plugin.testConnection())
       )
       .addButton((b) =>
         b.setButtonText("Disconnect").onClick(async () => {
@@ -1264,16 +1632,6 @@ class DriveMergeSettingTab extends PluginSettingTab {
       .addButton((b) =>
         b.setButtonText("Open transfer dialog").onClick(() => {
           new ConnectionTransferModal(this.plugin).open();
-        })
-      );
-
-    new Setting(containerEl)
-      .setName("Drive folder name")
-      .setDesc("Name of the sync folder in your drive; leave empty to use the vault's name.")
-      .addText((t) =>
-        t.setValue(this.plugin.settings.driveFolderName).onChange(async (v) => {
-          this.plugin.settings.driveFolderName = v;
-          await this.plugin.persist();
         })
       );
 

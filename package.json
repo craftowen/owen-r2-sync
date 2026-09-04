@@ -1,25 +1,28 @@
 {
-  "name": "owen-google-drive-sync",
-  "version": "1.0.0",
+  "name": "owen-r2-sync",
+  "version": "2.1.0",
   "private": true,
-  "description": "Private, safety-first Google Drive sync for Owen's Obsidian mobile mirror.",
+  "description": "Private, speed-first Cloudflare R2 sync for Owen's local Obsidian mobile vault.",
+  "workspaces": [
+    "worker"
+  ],
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "typecheck": "tsc -noEmit -skipLibCheck",
     "lint": "eslint src",
     "build": "npm run typecheck && node esbuild.config.mjs production",
-    "test:unit": "esbuild src/planner.ts --format=esm --outfile=test/planner.build.mjs && node test/planner.test.mjs && esbuild src/merge.ts --format=esm --outfile=test/merge.build.mjs && node -e \"import('./test/merge.build.mjs').then(m => { const r = m.merge3('a\\nb','a\\nB','a2\\nb'); if (r.merged !== 'a2\\nB') throw new Error('merge smoke failed'); console.log('merge: smoke passed'); })\" && esbuild src/conflict.ts --bundle --format=esm --outfile=test/conflict.build.mjs && node test/conflict.test.mjs && esbuild src/safety.ts --bundle --format=esm --outfile=test/safety.build.mjs && node test/safety.test.mjs && esbuild src/connection.ts --bundle --format=esm --outfile=test/connection.build.mjs && node test/connection.test.mjs && esbuild src/auth.ts --bundle --format=esm --outfile=test/auth.build.mjs --alias:obsidian=./test/obsidian-shim.mjs && node test/auth.test.mjs && esbuild src/main.ts --bundle --format=esm --outfile=test/main.build.mjs --alias:obsidian=./test/obsidian-shim.mjs --external:node:* && node test/executor.test.mjs",
-    "test:integration": "esbuild src/drive.ts --bundle --format=esm --outfile=test/drive.build.mjs --alias:obsidian=./test/obsidian-shim.mjs --external:node:* && node test/drive.integration.mjs",
+    "test:unit": "esbuild src/planner.ts --format=esm --outfile=test/planner.build.mjs && node test/planner.test.mjs && esbuild src/merge.ts --format=esm --outfile=test/merge.build.mjs && node -e \"import('./test/merge.build.mjs').then(m => { const r = m.merge3('a\\nb','a\\nB','a2\\nb'); if (r.merged !== 'a2\\nB') throw new Error('merge smoke failed'); console.log('merge: smoke passed'); })\" && esbuild src/conflict.ts --bundle --format=esm --outfile=test/conflict.build.mjs && node test/conflict.test.mjs && esbuild src/safety.ts --bundle --format=esm --outfile=test/safety.build.mjs && node test/safety.test.mjs && esbuild src/connection.ts --bundle --format=esm --outfile=test/connection.build.mjs && node test/connection.test.mjs && esbuild src/main.ts --bundle --format=esm --outfile=test/main.build.mjs --alias:obsidian=./test/obsidian-shim.mjs --external:node:* && node test/executor.test.mjs",
+    "test:integration": "esbuild src/r2.ts --bundle --format=esm --outfile=test/r2.build.mjs --alias:obsidian=./test/obsidian-shim.mjs --external:node:* && node test/r2.integration.mjs",
     "test:mobile": "node test/mobile-load.mjs",
     "test": "npm run test:unit && npm run test:integration",
     "package": "npm run build && node scripts/package.mjs",
-    "check": "npm run typecheck && npm run lint && npm test && npm run package && npm run test:mobile"
+    "check": "npm run typecheck && npm run lint && npm test && npm run package && npm run test:mobile && npm run check --workspace owen-r2-sync-worker"
   },
   "keywords": [
     "obsidian",
     "plugin",
-    "google-drive",
+    "cloudflare-r2",
     "sync"
   ],
   "author": "Owen",
@@ -29,7 +32,7 @@
     "esbuild": "^0.28.2",
     "eslint": "^9.39.4",
     "eslint-plugin-obsidianmd": "^0.4.1",
-    "obsidian": "^1.4.11",
+    "obsidian": "^1.13.1",
     "typescript": "^5.3.3",
     "typescript-eslint": "^8.63.0"
   }

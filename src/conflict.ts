@@ -16,7 +16,7 @@ export function mergeTextPreservingBoth(
     return { content: result.merged, conflicts: 0, preserveRemoteCopy: false };
   }
   return {
-    content: `<<<<<<< LOCAL\n${local}\n=======\n${remote}\n>>>>>>> GOOGLE DRIVE\n`,
+    content: `<<<<<<< LOCAL\n${local}\n=======\n${remote}\n>>>>>>> CLOUDFLARE R2\n`,
     conflicts: result.conflicts,
     preserveRemoteCopy: true,
   };
