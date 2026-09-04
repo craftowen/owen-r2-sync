@@ -50,6 +50,17 @@ Community plugins cannot continuously run after iOS suspends Obsidian. Sync runs
 - manually from the ribbon or command palette;
 - 30 seconds after a visible vault edit.
 
+## Releasing and installing updates
+
+The plugin is distributed through GitHub Releases on the private repo `craftowen/owen-r2-sync`
+and installed on every device with [BRAT](https://github.com/TfTHacker/obsidian42-brat)
+(repository path `craftowen/owen-r2-sync`, per-repo token for the private repo). BRAT checks for
+a newer release on startup and swaps the plugin files in place — no manual file copying.
+
+To ship a version: bump `version` in `manifest.json` and `versions.json`, then run
+`./scripts/release.sh "notes"`. It runs the unit tests, packages, tags, creates the GitHub
+Release with `main.js`/`manifest.json`/`styles.css`, and refreshes the Mac plugin folder.
+
 ## Cloudflare setup
 
 Deployment is intentionally not automatic.
