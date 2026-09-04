@@ -1102,8 +1102,9 @@ export default class R2SyncPlugin extends Plugin {
     }
   }
 
-  // Both inputs always remain recoverable. Text conflicts use explicit
-  // markers; binary conflicts keep the local input as a sibling copy.
+  // Both inputs always remain recoverable. Text conflicts never get inline
+  // markers: the newer side wins the canonical note and the older side becomes
+  // a sibling copy. Binary conflicts keep the local input as a sibling copy.
   private async resolveConflict(
     r2: R2Client,
     path: string,
@@ -1140,24 +1141,40 @@ export default class R2SyncPlugin extends Plugin {
       const localText = await this.app.vault.read(file);
       const remoteText = new TextDecoder().decode(remoteBytes);
       const baseText = await this.readBaseCopy(path);
-      const result = mergeTextPreservingBoth(baseText, localText, remoteText);
-      if (result.preserveRemoteCopy) {
-        await this.createConflictCopy(path, "R2", remoteBytes);
+      const localMtime = localEntry?.mtime ?? file.stat.mtime;
+      const localIsNewer = remoteEntry?.mtime === undefined || localMtime >= remoteEntry.mtime;
+      const result = mergeTextPreservingBoth(baseText, localText, remoteText, localIsNewer);
+      if (result.preserveCopy === "R2") await this.createConflictCopy(path, "R2", remoteBytes);
+      if (result.preserveCopy === "Local") await this.createConflictCopy(path, "Local", localBytes);
+      if (result.winner === "remote") {
+        // The R2 side already holds the canonical bytes; adopt them locally
+        // without re-uploading, exactly like a plain download.
+        await this.app.vault.modify(file, result.content);
+        const st = await this.freshStat(file);
+        this.base[path] = {
+          fileId,
+          localMtime: st.mtime,
+          localSize: st.size,
+          localHash: await sha256Hex(remoteBytes),
+          remoteRev: remoteEntry?.rev ?? "",
+        };
+        await this.writeBaseCopy(path, result.content);
+      } else {
+        if (result.content !== localText) await this.app.vault.modify(file, result.content);
+        await this.finishConflict(
+          r2,
+          path,
+          fileId,
+          result.content,
+          folderCache,
+          file,
+          remoteEntry?.rev
+        );
       }
-      await this.app.vault.modify(file, result.content);
-      await this.finishConflict(
-        r2,
-        path,
-        fileId,
-        result.content,
-        folderCache,
-        file,
-        remoteEntry?.rev
-      );
       if (result.conflicts > 0) {
         onMerge();
         new Notice(
-          `${path}: both versions were preserved with conflict markers and an R2 copy.`
+          `${path}: kept the newer ${result.winner === "local" ? "local" : "R2"} version; the other was saved as a conflict copy.`
         );
       }
       return;

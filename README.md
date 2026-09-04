@@ -23,7 +23,7 @@ The manifest keeps the legacy private plugin ID `owen-google-drive-sync` so an e
 - A new device adopts same-path/same-hash notes without downloading them.
 - Writes use R2 conditional PUT. Deletes use conditional tombstones, not unsafe `HEAD → DELETE`.
 - Uploads/downloads and conflict preservation finish before delete propagation.
-- Markdown/text can three-way merge. Conflicts and binary/structured formats preserve sibling copies.
+- Markdown/text can three-way merge. When lines truly collide, the more recently modified side becomes the canonical note and the other side is preserved as a `(R2 conflict …)` / `(Local conflict …)` sibling copy — conflict markers are never written into notes. Binary/structured formats keep the local input as a sibling copy.
 - Interrupted and suspicious plans stop for a fresh preview approval.
 - All non-excluded bytes are supported: Markdown, images, PDFs, Canvas, audio, video, and other attachments.
 - The token is kept in Obsidian SecretStorage. R2 credentials remain inside Cloudflare.

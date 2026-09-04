@@ -411,15 +411,16 @@ function snapshot({ rootId, base = {}, local, remote = {}, actions, fingerprint 
       fingerprint: "text-conflict",
     })
   );
-  assert.match(app.vault.text("note.md"), /<<<<<<< LOCAL/);
-  assert.match(app.vault.text("note.md"), /local version/);
-  assert.match(app.vault.text("note.md"), /remote version/);
+  // Local edit is newer than the R2 revision (clientMtime 2000): local wins the
+  // canonical note, the R2 text is preserved as a sibling copy, no markers.
+  assert.equal(app.vault.text("note.md"), "local version");
+  assert.doesNotMatch(app.vault.text("note.md"), /<<<<<<<|>>>>>>>/);
   const r2Copy = [...app.vault.entries.keys()].find((path) =>
     path.startsWith("note (R2 conflict ")
   );
   assert.ok(r2Copy);
   assert.equal(app.vault.text(r2Copy), "remote version");
-  assert.match(decoder.decode(await r2.download(updated.id)), /<<<<<<< LOCAL/);
+  assert.equal(decoder.decode(await r2.download(updated.id)), "local version");
   await mock.close();
 }
 
@@ -726,9 +727,9 @@ function snapshot({ rootId, base = {}, local, remote = {}, actions, fingerprint 
   await mock.close();
 }
 
-// A local edit made after approval is not overwritten by history. The remote
+// A local edit made after approval is never lost to history. The remote
 // restore completes, then the normal sync that follows runs unattended: the
-// conflict action preserves both inputs without a manual approval step.
+// newer restore wins the canonical note and the local edit is kept as a copy.
 {
   const mock = await startMockR2Worker();
   const app = makeApp({ "concurrent.md": "current" });
@@ -763,8 +764,14 @@ function snapshot({ rootId, base = {}, local, remote = {}, actions, fingerprint 
   const fingerprint = await plugin.historyApprovalFingerprint(approvedCurrent, version);
   await app.vault.modify(app.vault.getAbstractFileByPath("concurrent.md"), "local edit");
   assert.equal(await plugin.restoreHistoryVersion(approvedCurrent, version, fingerprint), true);
-  assert.match(app.vault.text("concurrent.md"), /local edit/);
-  assert.match(app.vault.text("concurrent.md"), /old/);
+  // The restore is the most recent modification, so the restored text becomes
+  // canonical; the concurrent local edit is preserved beside it, never lost.
+  assert.equal(app.vault.text("concurrent.md"), "old");
+  const localCopy = [...app.vault.entries.keys()].find((path) =>
+    path.startsWith("concurrent (Local conflict ")
+  );
+  assert.ok(localCopy);
+  assert.equal(app.vault.text(localCopy), "local edit");
   // Only the preserved conflict copy remains to upload; no further conflict or delete.
   const settledPlan = await plugin.preparePlan(plugin.client());
   assert.ok(settledPlan.actions.every((action) => action.kind === "uploadNew"));
