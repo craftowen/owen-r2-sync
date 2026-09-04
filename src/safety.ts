@@ -37,7 +37,6 @@ export function isMandatoryExcluded(path: string, configDir: string): boolean {
   const name = lower[lower.length - 1] ?? "";
   if (!name) return true;
   if (name === ".ds_store") return true;
-  if (parts.length === 1 && (name === "agents.md" || name === "claude.md")) return true;
   if (parts.length === 1 && name === "rclone_test") return true;
   if (name === "data.json" || name === "credentials.json") return true;
   if (name === ".env" || name.startsWith(".env.") || name === ".envrc") return true;

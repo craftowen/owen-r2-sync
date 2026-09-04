@@ -1,7 +1,7 @@
 {
   "id": "owen-google-drive-sync",
   "name": "Owen R2 Sync",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "minAppVersion": "1.11.4",
   "description": "Private foreground-only Cloudflare R2 sync with one-request indexing, conflict preservation, and immutable version history.",
   "author": "Owen",

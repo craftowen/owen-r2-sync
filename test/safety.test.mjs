@@ -21,8 +21,6 @@ for (const path of [
   "output/report.json",
   "60-studio/20-draft/private.md",
   ".DS_Store",
-  "AGENTS.md",
-  "CLAUDE.md",
   ".env.production",
   ".envrc",
   "keys/private.pem",
@@ -32,6 +30,9 @@ for (const path of [
   assert.equal(isMandatoryExcluded(path, ".obsidian"), true, `${path} must be excluded`);
 }
 assert.equal(isMandatoryExcluded("notes/daily.md", ".obsidian"), false);
+// Root rule files sync like any other note since 2.2.1 (one vault, one rulebook).
+assert.equal(isMandatoryExcluded("AGENTS.md", ".obsidian"), false);
+assert.equal(isMandatoryExcluded("CLAUDE.md", ".obsidian"), false);
 assert.doesNotThrow(() => assertTargetVault("owen-mobile"));
 assert.doesNotThrow(() => assertTargetVault("owen-brain"));
 assert.throws(() => assertTargetVault("other-vault"), /only syncs/);
