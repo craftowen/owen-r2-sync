@@ -4,6 +4,14 @@ on:
   push:
     branches: ["main"]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   test:
@@ -20,3 +28,26 @@ jobs:
 
       - name: Required quality gates
         run: npm run check
+
+      - name: Restore private Worker configuration
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          WORKER_CONFIG: ${{ secrets.CLOUDFLARE_WRANGLER_CONFIG }}
+        run: |
+          test -n "$WORKER_CONFIG"
+          printf '%s\n' "$WORKER_CONFIG" > worker/wrangler.production.jsonc
+
+      - name: Worker deployment gates
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        working-directory: worker
+        run: |
+          npx wrangler deploy --config wrangler.production.jsonc --dry-run
+          npx wrangler check startup --config wrangler.production.jsonc
+
+      - name: Deploy Worker to Cloudflare
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: deploy --config worker/wrangler.production.jsonc --keep-vars
