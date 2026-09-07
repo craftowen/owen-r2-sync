@@ -1,0 +1,42 @@
+name: Deploy OAuth site to Cloudflare Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - site/**
+      - .github/workflows/pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-oauth-site
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - name: Check static site files
+        run: |
+          test -s site/index.html
+          test -s site/privacy/index.html
+      - uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy site --project-name=owen-vault-sync --branch=main
+      - name: Check public pages
+        run: |
+          curl --fail --silent --show-error --retry 3 --retry-all-errors --user-agent 'Mozilla/5.0' --output /dev/null https://owen-vault-sync.pages.dev/
+          curl --fail --silent --show-error --retry 3 --retry-all-errors --user-agent 'Mozilla/5.0' --output /dev/null https://owen-vault-sync.pages.dev/privacy/
